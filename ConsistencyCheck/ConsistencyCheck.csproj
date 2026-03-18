@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <TargetFramework>net8.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <AssemblyName>ConsistencyCheck</AssemblyName>
+        <RootNamespace>ConsistencyCheck</RootNamespace>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <!-- RavenDB 6.x client — must match server version (6.2.13) -->
+        <PackageReference Include="RavenDB.Client" Version="6.*" />
+        <!-- Rich terminal UI: prompts, progress bars, live tables -->
+        <PackageReference Include="Spectre.Console" Version="0.49.*" />
+        <!-- Resilience and retry policies -->
+        <PackageReference Include="Polly" Version="8.*" />
+    </ItemGroup>
+
+</Project>
