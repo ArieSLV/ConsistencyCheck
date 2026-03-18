@@ -21,8 +21,7 @@ Console.CancelKeyPress += (_, e) =>
 {
     // Cancel the token instead of terminating immediately.
     e.Cancel = true;
-    AnsiConsole.MarkupLine(
-        "\n[yellow]Interrupt received — finishing current batch and saving progress…[/]");
+    AnsiConsole.MarkupLine("\n[yellow]Interrupt received — exiting…[/]");
     cts.Cancel();
 };
 
@@ -38,6 +37,9 @@ var progressStore = new ProgressStore(outputDir);
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration: load saved config or run the setup wizard
 // ─────────────────────────────────────────────────────────────────────────────
+
+try
+{
 
 AppConfig config;
 ProgressState progress;
@@ -89,10 +91,10 @@ if (progressStore.ConfigExists)
                               $"  ({progress.DocumentsInspected:N0} docs already inspected," +
                               $" {progress.MismatchesFound:N0} mismatches found)";
 
-            var choice = AnsiConsole.Prompt(
-                new SelectionPrompt<string>()
+            var choice = await new SelectionPrompt<string>()
                     .Title("[bold]A previous scan is in progress. What would you like to do?[/]")
-                    .AddChoices(resumeLabel, "Restart scan from the beginning", "Reconfigure (run wizard again)"));
+                    .AddChoices(resumeLabel, "Restart scan from the beginning", "Reconfigure (run wizard again)")
+                    .ShowAsync(AnsiConsole.Console, cts.Token);
 
             if (choice.StartsWith("Restart"))
             {
@@ -252,4 +254,10 @@ if (finalState.MismatchesFound > 0)
     AnsiConsole.MarkupLine(
         $"[yellow]Mismatch details have been written to [cyan]mismatches_*.csv[/] " +
         $"in the output directory.[/]");
+}
+
+} // end try
+catch (OperationCanceledException)
+{
+    AnsiConsole.MarkupLine("[yellow]Interrupted — exiting.[/]");
 }

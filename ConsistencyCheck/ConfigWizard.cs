@@ -52,20 +52,20 @@ public sealed class ConfigWizard
 
         // ── Step 1: Database name ─────────────────────────────────────────────
         PrintStep(1, 7, "Database name");
-        var databaseName = AnsiConsole.Prompt(
-            new TextPrompt<string>("  RavenDB [cyan]database name[/]:")
-                .Validate(s => string.IsNullOrWhiteSpace(s)
-                    ? ValidationResult.Error("[red]Database name cannot be empty.[/]")
-                    : ValidationResult.Success()));
+        var databaseName = await new TextPrompt<string>("  RavenDB [cyan]database name[/]:")
+            .Validate(s => string.IsNullOrWhiteSpace(s)
+                ? ValidationResult.Error("[red]Database name cannot be empty.[/]")
+                : ValidationResult.Success())
+            .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
 
         // ── Step 2: Node count ────────────────────────────────────────────────
         AnsiConsole.WriteLine();
         PrintStep(2, 7, "Number of cluster nodes");
-        var nodeCount = AnsiConsole.Prompt(
-            new SelectionPrompt<int>()
-                .Title("  How many [cyan]nodes[/] does the cluster have?")
-                .AddChoices(2, 3, 4, 5)
-                .UseConverter(n => n == 3 ? $"3 nodes [grey](typical)[/]" : $"{n} nodes"));
+        var nodeCount = await new SelectionPrompt<int>()
+            .Title("  How many [cyan]nodes[/] does the cluster have?")
+            .AddChoices(2, 3, 4, 5)
+            .UseConverter(n => n == 3 ? $"3 nodes [grey](typical)[/]" : $"{n} nodes")
+            .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
 
         // ── Step 3: Node details ──────────────────────────────────────────────
         AnsiConsole.WriteLine();
@@ -76,21 +76,21 @@ public sealed class ConfigWizard
             AnsiConsole.MarkupLine($"  [bold]Node {i + 1} of {nodeCount}[/]");
 
             var defaultLabel = $"Node {(char)('A' + i)}";
-            var label = AnsiConsole.Prompt(
-                new TextPrompt<string>($"    Label [grey](e.g. {defaultLabel})[/]:")
-                    .DefaultValue(defaultLabel)
-                    .AllowEmpty());
+            var label = await new TextPrompt<string>($"    Label [grey](e.g. {defaultLabel})[/]:")
+                .DefaultValue(defaultLabel)
+                .AllowEmpty()
+                .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
 
-            var url = AnsiConsole.Prompt(
-                new TextPrompt<string>($"    URL   [grey](e.g. https://node-a:8080)[/]:")
-                    .Validate(s =>
-                    {
-                        if (!Uri.TryCreate(s, UriKind.Absolute, out var uri))
-                            return ValidationResult.Error("[red]Not a valid URI.[/]");
-                        if (uri.Scheme != "http" && uri.Scheme != "https")
-                            return ValidationResult.Error("[red]Scheme must be http or https.[/]");
-                        return ValidationResult.Success();
-                    }));
+            var url = await new TextPrompt<string>($"    URL   [grey](e.g. https://node-a:8080)[/]:")
+                .Validate(s =>
+                {
+                    if (!Uri.TryCreate(s, UriKind.Absolute, out var uri))
+                        return ValidationResult.Error("[red]Not a valid URI.[/]");
+                    if (uri.Scheme != "http" && uri.Scheme != "https")
+                        return ValidationResult.Error("[red]Scheme must be http or https.[/]");
+                    return ValidationResult.Success();
+                })
+                .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
 
             // Normalise: strip trailing slash
             nodes.Add(new NodeConfig
@@ -106,10 +106,10 @@ public sealed class ConfigWizard
         AnsiConsole.MarkupLine("  [grey]Documents are iterated by ETag from this node.[/]");
         AnsiConsole.MarkupLine("  [grey]All other nodes are checked against the source.[/]");
 
-        var sourceChoice = AnsiConsole.Prompt(
-            new SelectionPrompt<string>()
-                .Title("  Select the [cyan]source node[/]:")
-                .AddChoices(nodes.Select(n => $"{n.Label}  ({n.Url})")));
+        var sourceChoice = await new SelectionPrompt<string>()
+            .Title("  Select the [cyan]source node[/]:")
+            .AddChoices(nodes.Select(n => $"{n.Label}  ({n.Url})"))
+            .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
 
         var sourceIndex = nodes.FindIndex(n => sourceChoice.StartsWith(n.Label));
 
@@ -117,7 +117,7 @@ public sealed class ConfigWizard
         AnsiConsole.WriteLine();
         PrintStep(5, 7, "Client certificate");
 
-        var (certPath, certPassword) = AskForCertificate();
+        var (certPath, certPassword) = AskForCertificate(ct);
 
         // ── Step 6: Scan mode ─────────────────────────────────────────────────
         AnsiConsole.WriteLine();
@@ -126,10 +126,10 @@ public sealed class ConfigWizard
         const string optionFirst  = "First mismatch  [grey]— stop as soon as one inconsistency is found (fast triage)[/]";
         const string optionAll    = "All mismatches  [grey]— scan the entire database (comprehensive report)[/]";
 
-        var modeChoice = AnsiConsole.Prompt(
-            new SelectionPrompt<string>()
-                .Title("  Select [cyan]scan mode[/]:")
-                .AddChoices(optionFirst, optionAll));
+        var modeChoice = await new SelectionPrompt<string>()
+            .Title("  Select [cyan]scan mode[/]:")
+            .AddChoices(optionFirst, optionAll)
+            .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
 
         var mode = modeChoice.StartsWith("First") ? CheckMode.FirstMismatch : CheckMode.AllMismatches;
 
@@ -138,7 +138,9 @@ public sealed class ConfigWizard
         PrintStep(7, 7, "Throttling (production safety)");
         AnsiConsole.MarkupLine("  Recommended defaults: PageSize=128, Delay=200 ms, Retries=3");
 
-        var useDefaults = AnsiConsole.Confirm("  Use recommended throttle [cyan]defaults[/]?", defaultValue: true);
+        var useDefaults = await new ConfirmationPrompt("  Use recommended throttle [cyan]defaults[/]?")
+            { DefaultValue = true }
+            .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
 
         ThrottleConfig throttle;
         if (useDefaults)
@@ -147,26 +149,26 @@ public sealed class ConfigWizard
         }
         else
         {
-            var pageSize = AnsiConsole.Prompt(
-                new TextPrompt<int>("    Page size [grey](documents per batch, 1-1024)[/]:")
-                    .DefaultValue(128)
-                    .Validate(v => v is >= 1 and <= 1024
-                        ? ValidationResult.Success()
-                        : ValidationResult.Error("[red]Must be between 1 and 1024.[/]")));
+            var pageSize = await new TextPrompt<int>("    Page size [grey](documents per batch, 1-1024)[/]:")
+                .DefaultValue(128)
+                .Validate(v => v is >= 1 and <= 1024
+                    ? ValidationResult.Success()
+                    : ValidationResult.Error("[red]Must be between 1 and 1024.[/]"))
+                .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
 
-            var delayMs = AnsiConsole.Prompt(
-                new TextPrompt<int>("    Delay between batches [grey](ms, 0-60000)[/]:")
-                    .DefaultValue(200)
-                    .Validate(v => v is >= 0 and <= 60_000
-                        ? ValidationResult.Success()
-                        : ValidationResult.Error("[red]Must be between 0 and 60000.[/]")));
+            var delayMs = await new TextPrompt<int>("    Delay between batches [grey](ms, 0-60000)[/]:")
+                .DefaultValue(200)
+                .Validate(v => v is >= 0 and <= 60_000
+                    ? ValidationResult.Success()
+                    : ValidationResult.Error("[red]Must be between 0 and 60000.[/]"))
+                .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
 
-            var retries = AnsiConsole.Prompt(
-                new TextPrompt<int>("    Max retries on transient errors [grey](1-10)[/]:")
-                    .DefaultValue(3)
-                    .Validate(v => v is >= 1 and <= 10
-                        ? ValidationResult.Success()
-                        : ValidationResult.Error("[red]Must be between 1 and 10.[/]")));
+            var retries = await new TextPrompt<int>("    Max retries on transient errors [grey](1-10)[/]:")
+                .DefaultValue(3)
+                .Validate(v => v is >= 1 and <= 10
+                    ? ValidationResult.Success()
+                    : ValidationResult.Error("[red]Must be between 1 and 10.[/]"))
+                .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
 
             throttle = new ThrottleConfig
             {
@@ -198,9 +200,10 @@ public sealed class ConfigWizard
         if (!allOk)
         {
             AnsiConsole.WriteLine();
-            var proceed = AnsiConsole.Confirm(
-                "  [yellow]One or more nodes failed the connectivity test.[/] Continue anyway?",
-                defaultValue: false);
+            var proceed = await new ConfirmationPrompt(
+                    "  [yellow]One or more nodes failed the connectivity test.[/] Continue anyway?")
+                { DefaultValue = false }
+                .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
 
             if (!proceed)
             {
@@ -262,7 +265,7 @@ public sealed class ConfigWizard
         {
             AnsiConsole.MarkupLine("[bold cyan]Certificate[/] — [bold]Client certificate[/]");
             AnsiConsole.WriteLine();
-            var (certPath, certPassword) = AskForCertificate();
+            var (certPath, certPassword) = AskForCertificate(ct);
             config.CertificatePath   = certPath;
             config.CertificatePassword = certPassword;
         }
@@ -276,9 +279,10 @@ public sealed class ConfigWizard
         if (!allOk)
         {
             AnsiConsole.WriteLine();
-            var proceed = AnsiConsole.Confirm(
-                "  [yellow]One or more nodes failed the connectivity test.[/] Continue anyway?",
-                defaultValue: false);
+            var proceed = await new ConfirmationPrompt(
+                    "  [yellow]One or more nodes failed the connectivity test.[/] Continue anyway?")
+                { DefaultValue = false }
+                .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
 
             if (!proceed)
             {
@@ -310,8 +314,9 @@ public sealed class ConfigWizard
     /// A tuple of (<c>certPath</c>, <c>certPassword</c>).
     /// <c>certPath</c> is <see cref="string.Empty"/> when no certificate is required.
     /// </returns>
-    private static (string certPath, string certPassword) AskForCertificate()
+    private static (string certPath, string certPassword) AskForCertificate(CancellationToken ct)
     {
+        ct.ThrowIfCancellationRequested();
         var needsCert = AnsiConsole.Confirm(
             "  Does the cluster require a [cyan]client certificate[/]?");
 
@@ -327,6 +332,7 @@ public sealed class ConfigWizard
         {
             AnsiConsole.Markup("    Path to certificate [grey](.pfx / .p12)[/]: ");
             var input = (Console.ReadLine() ?? string.Empty).Trim('"');
+            ct.ThrowIfCancellationRequested();
 
             if (string.IsNullOrWhiteSpace(input))
             {
