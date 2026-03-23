@@ -100,6 +100,9 @@ public sealed class ProgressStore
                 $"Configuration file is malformed: {ex.Message}", ex);
         }
 
+        foreach (var node in config.Nodes)
+            node.Url = node.Url.TrimEnd('/');
+
         ValidateConfig(config);
         return config;
     }

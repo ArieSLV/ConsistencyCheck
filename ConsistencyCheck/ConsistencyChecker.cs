@@ -231,13 +231,18 @@ public sealed class ConsistencyChecker : IAsyncDisposable
     private async Task<List<(string Id, string ChangeVector)>> FetchSourceBatchAsync(
         long startEtag, int pageSize, CancellationToken ct)
     {
-        var url = $"{_config.SourceNode.Url}/databases/{_config.DatabaseName}/docs" +
+        var url = $"{_config.SourceNode.Url.TrimEnd('/')}/databases/{_config.DatabaseName}/docs" +
                   $"?etag={startEtag}&pageSize={pageSize}&metadataOnly=true";
 
         var responseBody = await _retry.ExecuteAsync(async token =>
         {
             using var response = await _sourceHttpClient.GetAsync(url, token).ConfigureAwait(false);
-            response.EnsureSuccessStatusCode();
+            if (!response.IsSuccessStatusCode)
+            {
+                var errorBody = await response.Content.ReadAsStringAsync(token).ConfigureAwait(false);
+                throw new HttpRequestException(
+                    $"Request to {url} failed with {(int)response.StatusCode} ({response.ReasonPhrase}): {errorBody}");
+            }
             return await response.Content.ReadAsStringAsync(token).ConfigureAwait(false);
         }, ct).ConfigureAwait(false);
 
@@ -535,7 +540,7 @@ public sealed class ConsistencyChecker : IAsyncDisposable
     /// </summary>
     private async Task<string> FetchSourceDatabaseIdAsync(CancellationToken ct)
     {
-        var url = $"{_config.SourceNode.Url}/databases/{_config.DatabaseName}/debug/database-info";
+        var url = $"{_config.SourceNode.Url.TrimEnd('/')}/databases/{_config.DatabaseName}/debug/database-info";
 
         try
         {
@@ -578,7 +583,7 @@ public sealed class ConsistencyChecker : IAsyncDisposable
     /// </remarks>
     public async Task<long?> FetchMaxEtagAsync(CancellationToken ct)
     {
-        var url = $"{_config.SourceNode.Url}/databases/{_config.DatabaseName}/stats";
+        var url = $"{_config.SourceNode.Url.TrimEnd('/')}/databases/{_config.DatabaseName}/stats";
 
         try
         {
