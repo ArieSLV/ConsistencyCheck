@@ -17,6 +17,11 @@ namespace ConsistencyCheck;
 /// same files rather than creating duplicates with redundant headers.
 /// </para>
 /// <para>
+/// If the latest file is temporarily locked by another process (for example, opened in
+/// Excel), the writer automatically advances to the next numbered file instead of
+/// aborting the scan.
+/// </para>
+/// <para>
 /// <strong>Thread safety:</strong> a <see cref="SemaphoreSlim"/> serialises all writes.
 /// The parallel fan-out in <see cref="ConsistencyChecker"/> may call
 /// <see cref="WriteAsync"/> from multiple concurrent tasks simultaneously.
@@ -32,7 +37,7 @@ public sealed class ResultsWriter : IAsyncDisposable
     private const string FilePattern = "mismatches_{0:D3}.csv";
 
     private static readonly string CsvHeader =
-        "Id,MismatchType,SourceNode,TargetNode,SourceCV,TargetCV,DetectedAt";
+        "Id,MismatchType,SourceNode,TargetNode,SourceCV,TargetCV,SourceLastModified,TargetLastModified,DetectedAt";
 
     // ── State ─────────────────────────────────────────────────────────────────
 
@@ -126,19 +131,33 @@ public sealed class ResultsWriter : IAsyncDisposable
         if (_writer != null)
             return;
 
-        var path      = GetFilePath(_fileIndex);
-        var fileExists = File.Exists(path);
-        var fileSize  = fileExists ? new FileInfo(path).Length : 0L;
-
-        _writer          = new StreamWriter(path, append: true, Encoding.UTF8);
-        _currentFileSize = fileSize;
-
-        if (fileSize == 0)
+        while (true)
         {
-            // New file — write the header row first.
-            await _writer.WriteLineAsync(CsvHeader.AsMemory(), ct).ConfigureAwait(false);
-            await _writer.FlushAsync(ct).ConfigureAwait(false);
-            _currentFileSize += Encoding.UTF8.GetByteCount(CsvHeader) + Environment.NewLine.Length;
+            var path      = GetFilePath(_fileIndex);
+            var fileExists = File.Exists(path);
+            var fileSize  = fileExists ? new FileInfo(path).Length : 0L;
+
+            try
+            {
+                _writer          = OpenAppendWriter(path);
+                _currentFileSize = fileSize;
+
+                if (fileSize == 0)
+                {
+                    // New file — write the header row first.
+                    await _writer.WriteLineAsync(CsvHeader.AsMemory(), ct).ConfigureAwait(false);
+                    await _writer.FlushAsync(ct).ConfigureAwait(false);
+                    _currentFileSize += Encoding.UTF8.GetByteCount(CsvHeader) + Environment.NewLine.Length;
+                }
+
+                return;
+            }
+            catch (IOException ex) when (IsFileLocked(ex))
+            {
+                // Someone else is holding the current file. Keep the scan running by
+                // switching to the next numbered file.
+                _fileIndex++;
+            }
         }
     }
 
@@ -158,7 +177,7 @@ public sealed class ResultsWriter : IAsyncDisposable
         _fileIndex++;
 
         var newPath = GetFilePath(_fileIndex);
-        _writer          = new StreamWriter(newPath, append: false, Encoding.UTF8);
+        _writer          = OpenCreateWriter(newPath);
         _currentFileSize = 0L;
 
         // Write header to the freshly rotated file.
@@ -180,6 +199,8 @@ public sealed class ResultsWriter : IAsyncDisposable
             EscapeCsvField(r.TargetNode),
             EscapeCsvField(r.SourceCV),
             EscapeCsvField(r.TargetCV),
+            EscapeCsvField(r.SourceLastModified),
+            EscapeCsvField(r.TargetLastModified),
             EscapeCsvField(r.DetectedAt.ToString("o")));
 
     /// <summary>
@@ -203,6 +224,15 @@ public sealed class ResultsWriter : IAsyncDisposable
     /// <summary>Returns the full path for the CSV file at the given 1-based index.</summary>
     private string GetFilePath(int index) =>
         Path.Combine(_outputDirectory, string.Format(FilePattern, index));
+
+    private static StreamWriter OpenAppendWriter(string path) =>
+        new(new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite), Encoding.UTF8);
+
+    private static StreamWriter OpenCreateWriter(string path) =>
+        new(new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.ReadWrite), Encoding.UTF8);
+
+    private static bool IsFileLocked(IOException ex)
+        => ex.HResult is unchecked((int)0x80070020) or unchecked((int)0x80070021);
 
     /// <summary>
     /// Scans <paramref name="directory"/> for existing <c>mismatches_NNN.csv</c> files

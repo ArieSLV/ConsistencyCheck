@@ -103,6 +103,17 @@ public sealed class ProgressStore
         foreach (var node in config.Nodes)
             node.Url = node.Url.TrimEnd('/');
 
+        config.MissingProperties = DetectMissingProperties(json);
+        config.CertificateThumbprint = string.IsNullOrWhiteSpace(config.CertificateThumbprint)
+            ? null
+            : config.CertificateThumbprint.Trim();
+
+        config.Throttle ??= new ThrottleConfig();
+        config.StateStore ??= new StateStoreConfig();
+
+        if (config.SourceNodeIndex < 0 || config.SourceNodeIndex >= config.Nodes.Count)
+            config.SourceNodeIndex = 0;
+
         ValidateConfig(config);
         return config;
     }
@@ -114,6 +125,7 @@ public sealed class ProgressStore
     public void SaveConfig(AppConfig config)
     {
         ValidateConfig(config);
+        config.MissingProperties.Clear();
         AtomicWrite(_configPath, config);
     }
 
@@ -201,11 +213,6 @@ public sealed class ProgressStore
             throw new InvalidOperationException(
                 "At least two nodes must be configured (one source and one target).");
 
-        if (config.SourceNodeIndex < 0 || config.SourceNodeIndex >= config.Nodes.Count)
-            throw new InvalidOperationException(
-                $"SourceNodeIndex ({config.SourceNodeIndex}) is out of range " +
-                $"for Nodes list of length {config.Nodes.Count}.");
-
         foreach (var node in config.Nodes)
         {
             if (string.IsNullOrWhiteSpace(node.Url))
@@ -222,5 +229,135 @@ public sealed class ProgressStore
             !File.Exists(config.CertificatePath))
             throw new InvalidOperationException(
                 $"Certificate file not found: {config.CertificatePath}");
+
+        if (config.CertificateThumbprint != null &&
+            string.IsNullOrWhiteSpace(config.CertificateThumbprint))
+            throw new InvalidOperationException("CertificateThumbprint must not be empty when specified.");
+
+        if (config.StartEtag is < 0)
+            throw new InvalidOperationException("StartEtag must be >= 0.");
+
+        if (config.Throttle.PageSize is < 1 or > 1024)
+            throw new InvalidOperationException("Throttle.PageSize must be between 1 and 1024.");
+
+        if (config.Throttle.DelayBetweenBatchesMs is < 0 or > 60_000)
+            throw new InvalidOperationException(
+                "Throttle.DelayBetweenBatchesMs must be between 0 and 60000.");
+
+        if (config.Throttle.MaxRetries is < 1 or > 10)
+            throw new InvalidOperationException("Throttle.MaxRetries must be between 1 and 10.");
+
+        if (config.Throttle.RetryBaseDelayMs is < 100 or > 10_000)
+            throw new InvalidOperationException(
+                "Throttle.RetryBaseDelayMs must be between 100 and 10000.");
+
+        if (config.Throttle.ClusterLookupBatchSize < 1)
+            throw new InvalidOperationException(
+                "Throttle.ClusterLookupBatchSize must be >= 1.");
+
+        if (string.IsNullOrWhiteSpace(config.StateStore.ServerUrl))
+            throw new InvalidOperationException("StateStore.ServerUrl must not be empty.");
+
+        if (!Uri.TryCreate(config.StateStore.ServerUrl, UriKind.Absolute, out var stateStoreUri) ||
+            (stateStoreUri.Scheme != "http" && stateStoreUri.Scheme != "https"))
+            throw new InvalidOperationException(
+                $"StateStore.ServerUrl is not a valid http/https URI: {config.StateStore.ServerUrl}");
+
+        if (string.IsNullOrWhiteSpace(config.StateStore.DatabaseName))
+            throw new InvalidOperationException("StateStore.DatabaseName must not be empty.");
+    }
+
+    private static HashSet<string> DetectMissingProperties(string json)
+    {
+        using var document = JsonDocument.Parse(json);
+        if (document.RootElement.ValueKind != JsonValueKind.Object)
+            return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        var missing = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var root = document.RootElement;
+        var rootProperties = GetPropertyNames(root);
+
+        if (!rootProperties.Contains(nameof(AppConfig.RunMode)))
+            missing.Add(nameof(AppConfig.RunMode));
+
+        if (!rootProperties.Contains(nameof(AppConfig.Mode)))
+            missing.Add(nameof(AppConfig.Mode));
+
+        if (!rootProperties.Contains(nameof(AppConfig.StartEtag)))
+            missing.Add(nameof(AppConfig.StartEtag));
+
+        if (!rootProperties.Contains(nameof(AppConfig.AllowInvalidServerCertificates)))
+            missing.Add(nameof(AppConfig.AllowInvalidServerCertificates));
+
+        var hasCertificatePath = rootProperties.Contains(nameof(AppConfig.CertificatePath));
+        var hasCertificateThumbprint = rootProperties.Contains(nameof(AppConfig.CertificateThumbprint));
+        if (!hasCertificatePath && !hasCertificateThumbprint)
+        {
+            missing.Add("Certificate");
+        }
+        else if (hasCertificatePath &&
+                 TryGetProperty(root, nameof(AppConfig.CertificatePath), out var certificatePathElement) &&
+                 certificatePathElement.ValueKind == JsonValueKind.String &&
+                 string.IsNullOrEmpty(certificatePathElement.GetString()) == false &&
+                 !rootProperties.Contains(nameof(AppConfig.CertificatePassword)))
+        {
+            missing.Add("Certificate");
+        }
+
+        if (!HasAllProperties(root, nameof(AppConfig.Throttle),
+                nameof(ThrottleConfig.PageSize),
+                nameof(ThrottleConfig.DelayBetweenBatchesMs),
+                nameof(ThrottleConfig.MaxRetries),
+                nameof(ThrottleConfig.RetryBaseDelayMs),
+                nameof(ThrottleConfig.ClusterLookupBatchSize)))
+        {
+            missing.Add(nameof(AppConfig.Throttle));
+        }
+
+        if (!HasAllProperties(root, nameof(AppConfig.StateStore),
+                nameof(StateStoreConfig.ServerUrl),
+                nameof(StateStoreConfig.DatabaseName),
+                nameof(StateStoreConfig.EnableDiagnostics)))
+        {
+            missing.Add(nameof(AppConfig.StateStore));
+        }
+
+        return missing;
+    }
+
+    private static bool HasAllProperties(JsonElement root, string objectPropertyName, params string[] requiredProperties)
+    {
+        if (!TryGetProperty(root, objectPropertyName, out var objectElement) ||
+            objectElement.ValueKind != JsonValueKind.Object)
+        {
+            return false;
+        }
+
+        var properties = GetPropertyNames(objectElement);
+        return requiredProperties.All(properties.Contains);
+    }
+
+    private static HashSet<string> GetPropertyNames(JsonElement element)
+    {
+        var properties = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var property in element.EnumerateObject())
+            properties.Add(property.Name);
+
+        return properties;
+    }
+
+    private static bool TryGetProperty(JsonElement element, string propertyName, out JsonElement value)
+    {
+        foreach (var property in element.EnumerateObject())
+        {
+            if (string.Equals(property.Name, propertyName, StringComparison.OrdinalIgnoreCase))
+            {
+                value = property.Value;
+                return true;
+            }
+        }
+
+        value = default;
+        return false;
     }
 }

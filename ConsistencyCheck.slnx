@@ -1,3 +1,4 @@
 <Solution>
   <Project Path="ConsistencyCheck/ConsistencyCheck.csproj" />
+  <Project Path="ConsistencyCheck.Tests/ConsistencyCheck.Tests.csproj" />
 </Solution>

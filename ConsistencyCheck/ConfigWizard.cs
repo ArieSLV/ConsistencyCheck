@@ -1,3 +1,4 @@
+using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using Raven.Client.Documents;
 using Raven.Client.Documents.Conventions;
@@ -7,69 +8,41 @@ using Spectre.Console;
 namespace ConsistencyCheck;
 
 /// <summary>
-/// Interactive configuration wizard that guides the user through cluster setup,
-/// validates connectivity to every node, and saves the resulting
-/// <see cref="AppConfig"/> to disk via <see cref="ProgressStore"/>.
+/// Interactive configuration wizard for the consistency checker.
 /// </summary>
-/// <remarks>
-/// The wizard is shown on the very first run (no <c>config.json</c> found) and
-/// whenever the user chooses "Reconfigure" at the resume prompt.
-/// All prompts are rendered with <c>Spectre.Console</c> for a clean, interactive
-/// terminal experience.
-/// </remarks>
 public sealed class ConfigWizard
 {
     private readonly ProgressStore _store;
 
-    /// <summary>
-    /// Initialises the wizard backed by the given <paramref name="store"/>.
-    /// </summary>
-    /// <param name="store">
-    /// The persistence store used to save the finished configuration.
-    /// </param>
     public ConfigWizard(ProgressStore store)
     {
         _store = store;
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Public entry point
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Runs the full interactive wizard, persists the result via
-    /// <see cref="ProgressStore.SaveConfig"/>, and returns the completed
-    /// <see cref="AppConfig"/>.
-    /// </summary>
-    /// <param name="ct">Cancellation token for CTRL+C support.</param>
-    /// <returns>The validated and saved application configuration.</returns>
     public async Task<AppConfig> RunAsync(CancellationToken ct)
     {
         AnsiConsole.MarkupLine("[bold yellow]Configuration Wizard[/]");
-        AnsiConsole.MarkupLine("[grey]Answer each prompt to configure the consistency checker.[/]");
+        AnsiConsole.MarkupLine("[grey]Answer each prompt to configure the scan / repair tool.[/]");
         AnsiConsole.MarkupLine("[grey]Press CTRL+C at any time to abort.[/]");
         AnsiConsole.WriteLine();
 
-        // ── Step 1: Database name ─────────────────────────────────────────────
-        PrintStep(1, 7, "Database name");
+        PrintStep(1, 9, "Database name");
         var databaseName = await new TextPrompt<string>("  RavenDB [cyan]database name[/]:")
-            .Validate(s => string.IsNullOrWhiteSpace(s)
+            .Validate(value => string.IsNullOrWhiteSpace(value)
                 ? ValidationResult.Error("[red]Database name cannot be empty.[/]")
                 : ValidationResult.Success())
             .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
 
-        // ── Step 2: Node count ────────────────────────────────────────────────
         AnsiConsole.WriteLine();
-        PrintStep(2, 7, "Number of cluster nodes");
+        PrintStep(2, 9, "Number of cluster nodes");
         var nodeCount = await new SelectionPrompt<int>()
             .Title("  How many [cyan]nodes[/] does the cluster have?")
             .AddChoices(2, 3, 4, 5)
-            .UseConverter(n => n == 3 ? $"3 nodes [grey](typical)[/]" : $"{n} nodes")
+            .UseConverter(n => n == 3 ? "3 nodes [grey](typical)[/]" : $"{n} nodes")
             .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
 
-        // ── Step 3: Node details ──────────────────────────────────────────────
         AnsiConsole.WriteLine();
-        PrintStep(3, 7, "Node URLs and labels");
+        PrintStep(3, 9, "Node URLs and labels");
         var nodes = new List<NodeConfig>();
         for (var i = 0; i < nodeCount; i++)
         {
@@ -82,9 +55,9 @@ public sealed class ConfigWizard
                 .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
 
             var url = await new TextPrompt<string>($"    URL   [grey](e.g. https://node-a:8080)[/]:")
-                .Validate(s =>
+                .Validate(value =>
                 {
-                    if (!Uri.TryCreate(s, UriKind.Absolute, out var uri))
+                    if (!Uri.TryCreate(value, UriKind.Absolute, out var uri))
                         return ValidationResult.Error("[red]Not a valid URI.[/]");
                     if (uri.Scheme != "http" && uri.Scheme != "https")
                         return ValidationResult.Error("[red]Scheme must be http or https.[/]");
@@ -92,231 +65,377 @@ public sealed class ConfigWizard
                 })
                 .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
 
-            // Normalise: strip trailing slash
             nodes.Add(new NodeConfig
             {
                 Label = string.IsNullOrWhiteSpace(label) ? defaultLabel : label,
-                Url   = url.TrimEnd('/')
+                Url = url.TrimEnd('/')
             });
         }
 
-        // ── Step 4: Source node ───────────────────────────────────────────────
         AnsiConsole.WriteLine();
-        PrintStep(4, 7, "Source node (iteration origin)");
-        AnsiConsole.MarkupLine("  [grey]Documents are iterated by ETag from this node.[/]");
-        AnsiConsole.MarkupLine("  [grey]All other nodes are checked against the source.[/]");
-
-        var sourceChoice = await new SelectionPrompt<string>()
-            .Title("  Select the [cyan]source node[/]:")
-            .AddChoices(nodes.Select(n => $"{n.Label}  ({n.Url})"))
-            .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
-
-        var sourceIndex = nodes.FindIndex(n => sourceChoice.StartsWith(n.Label));
-
-        // ── Step 5: Certificate ───────────────────────────────────────────────
-        AnsiConsole.WriteLine();
-        PrintStep(5, 7, "Client certificate");
-
+        PrintStep(4, 9, "Client certificate");
         var (certPath, certPassword) = AskForCertificate(ct);
 
-        // ── Step 6: Scan mode ─────────────────────────────────────────────────
         AnsiConsole.WriteLine();
-        PrintStep(6, 7, "Scan mode");
+        PrintStep(5, 9, "TLS validation");
+        var allowInvalidServerCertificates = await AskForServerCertificateValidationAsync(nodes, ct).ConfigureAwait(false);
 
-        const string optionFirst  = "First mismatch  [grey]— stop as soon as one inconsistency is found (fast triage)[/]";
-        const string optionAll    = "All mismatches  [grey]— scan the entire database (comprehensive report)[/]";
+        AnsiConsole.WriteLine();
+        PrintStep(6, 9, "Run mode");
+        var (runMode, scanMode) = await AskForRunModeAsync(ct).ConfigureAwait(false);
 
-        var modeChoice = await new SelectionPrompt<string>()
-            .Title("  Select [cyan]scan mode[/]:")
-            .AddChoices(optionFirst, optionAll)
+        AnsiConsole.WriteLine();
+        PrintStep(7, 9, "Starting position");
+        var startEtag = await AskForStartEtagAsync(ct).ConfigureAwait(false);
+
+        AnsiConsole.WriteLine();
+        PrintStep(8, 9, "Throttling");
+        var throttle = await AskForThrottleAsync(ct).ConfigureAwait(false);
+
+        AnsiConsole.WriteLine();
+        PrintStep(9, 9, "Local state storage");
+        var stateStore = await AskForStateStoreAsync(ct).ConfigureAwait(false);
+
+        var config = new AppConfig
+        {
+            DatabaseName = databaseName,
+            Nodes = nodes,
+            SourceNodeIndex = 0,
+            CertificatePath = certPath,
+            CertificatePassword = certPassword,
+            AllowInvalidServerCertificates = allowInvalidServerCertificates,
+            RunMode = runMode,
+            Mode = scanMode,
+            StartEtag = startEtag,
+            Throttle = throttle,
+            StateStore = stateStore
+        };
+
+        AnsiConsole.WriteLine();
+        AnsiConsole.MarkupLine("[bold]Testing connectivity to all cluster nodes...[/]");
+
+        var allOk = await TestConnectivityAsync(config, ct).ConfigureAwait(false);
+        if (!allOk)
+        {
+            AnsiConsole.WriteLine();
+            var proceed = await new ConfirmationPrompt(
+                    "  [yellow]One or more nodes failed the connectivity test.[/] Continue anyway?")
+                { DefaultValue = false }
+                .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
+
+            if (!proceed)
+            {
+                AnsiConsole.MarkupLine("[red]Setup cancelled.[/]");
+                throw new OperationCanceledException("User cancelled after connectivity failure.");
+            }
+        }
+
+        _store.SaveConfig(config);
+
+        AnsiConsole.WriteLine();
+        DisplayConfigSummary(config);
+        AnsiConsole.MarkupLine("[green]Configuration saved.[/]");
+        AnsiConsole.WriteLine();
+
+        return config;
+    }
+
+    internal static bool IsConfigComplete(AppConfig config)
+        => !NeedsCertificatePrompt(config)
+           && !NeedsTlsValidationPrompt(config)
+           && !NeedsRunModePrompt(config)
+           && !NeedsThrottlePrompt(config)
+           && !NeedsStateStorePrompt(config)
+           && !NeedsStartEtagPrompt(config);
+
+    public async Task<AppConfig> CompleteConfigAsync(AppConfig config, CancellationToken ct)
+    {
+        config.Throttle ??= new ThrottleConfig();
+        config.StateStore ??= new StateStoreConfig();
+        if (config.SourceNodeIndex < 0 || config.SourceNodeIndex >= config.Nodes.Count)
+            config.SourceNodeIndex = 0;
+
+        AnsiConsole.MarkupLine("[bold yellow]Configuration Completion[/]");
+        AnsiConsole.MarkupLine("[grey]A pre-filled configuration was found. Please supply the missing details below.[/]");
+        AnsiConsole.WriteLine();
+
+        DisplayConfigSummary(config);
+        AnsiConsole.WriteLine();
+
+        if (NeedsCertificatePrompt(config))
+        {
+            AnsiConsole.MarkupLine("[bold cyan]Certificate[/] — [bold]Client certificate[/]");
+            AnsiConsole.WriteLine();
+            var (certPath, certPassword) = AskForCertificate(ct);
+            config.CertificateThumbprint = null;
+            config.CertificatePath = certPath;
+            config.CertificatePassword = certPassword;
+            config.MissingProperties.Remove("Certificate");
+        }
+
+        if (NeedsTlsValidationPrompt(config))
+        {
+            AnsiConsole.WriteLine();
+            AnsiConsole.MarkupLine("[bold cyan]TLS validation[/] — [bold]Server certificate validation[/]");
+            AnsiConsole.WriteLine();
+            config.AllowInvalidServerCertificates =
+                await AskForServerCertificateValidationAsync(config.Nodes, ct).ConfigureAwait(false);
+            config.MissingProperties.Remove(nameof(AppConfig.AllowInvalidServerCertificates));
+        }
+
+        if (NeedsRunModePrompt(config))
+        {
+            AnsiConsole.WriteLine();
+            AnsiConsole.MarkupLine("[bold cyan]Run mode[/] — [bold]Scan / repair behavior[/]");
+            AnsiConsole.WriteLine();
+            var (runMode, scanMode) = await AskForRunModeAsync(ct).ConfigureAwait(false);
+            config.RunMode = runMode;
+            config.Mode = scanMode;
+            config.MissingProperties.Remove(nameof(AppConfig.RunMode));
+            config.MissingProperties.Remove(nameof(AppConfig.Mode));
+        }
+
+        if (NeedsStartEtagPrompt(config))
+        {
+            AnsiConsole.WriteLine();
+            AnsiConsole.MarkupLine("[bold cyan]Starting position[/] — [bold]Start ETag[/]");
+            AnsiConsole.WriteLine();
+            config.StartEtag = await AskForStartEtagAsync(ct).ConfigureAwait(false);
+            config.MissingProperties.Remove(nameof(AppConfig.StartEtag));
+        }
+
+        if (NeedsThrottlePrompt(config))
+        {
+            AnsiConsole.WriteLine();
+            AnsiConsole.MarkupLine("[bold cyan]Throttling[/] — [bold]Batch and retry settings[/]");
+            AnsiConsole.WriteLine();
+            config.Throttle = await AskForThrottleAsync(ct).ConfigureAwait(false);
+            config.MissingProperties.Remove(nameof(AppConfig.Throttle));
+        }
+
+        if (NeedsStateStorePrompt(config))
+        {
+            AnsiConsole.WriteLine();
+            AnsiConsole.MarkupLine("[bold cyan]Local state storage[/] — [bold]RavenDB state database[/]");
+            AnsiConsole.WriteLine();
+            config.StateStore = await AskForStateStoreAsync(ct).ConfigureAwait(false);
+            config.MissingProperties.Remove(nameof(AppConfig.StateStore));
+        }
+
+        AnsiConsole.WriteLine();
+        AnsiConsole.MarkupLine("[bold]Testing connectivity to all cluster nodes...[/]");
+
+        var allOk = await TestConnectivityAsync(config, ct).ConfigureAwait(false);
+        if (!allOk)
+        {
+            AnsiConsole.WriteLine();
+            var proceed = await new ConfirmationPrompt(
+                    "  [yellow]One or more nodes failed the connectivity test.[/] Continue anyway?")
+                { DefaultValue = false }
+                .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
+
+            if (!proceed)
+            {
+                AnsiConsole.MarkupLine("[red]Setup cancelled.[/]");
+                throw new OperationCanceledException("User cancelled after connectivity failure.");
+            }
+        }
+
+        _store.SaveConfig(config);
+
+        AnsiConsole.WriteLine();
+        DisplayConfigSummary(config);
+        AnsiConsole.MarkupLine("[green]Configuration saved.[/]");
+        AnsiConsole.WriteLine();
+
+        return config;
+    }
+
+    private static async Task<(RunMode RunMode, CheckMode CheckMode)> AskForRunModeAsync(CancellationToken ct)
+    {
+        const string scanOnlyOption =
+            "Scan only  [grey]— detect inconsistencies without modifying the cluster[/]";
+        const string dryRunRepairOption =
+            "Dry-run repair  [grey]— plan exact repair actions without changing the cluster[/]";
+        const string scanAndRepairOption =
+            "Scan and repair  [grey]— detect inconsistencies and touch the winner copy[/]";
+
+        var runModeChoice = await new SelectionPrompt<string>()
+            .Title("  Select [cyan]run mode[/]:")
+            .AddChoices(scanOnlyOption, dryRunRepairOption, scanAndRepairOption)
             .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
 
-        var mode = modeChoice.StartsWith("First") ? CheckMode.FirstMismatch : CheckMode.AllMismatches;
+        var runMode = runModeChoice switch
+        {
+            dryRunRepairOption => RunMode.DryRunRepair,
+            scanAndRepairOption => RunMode.ScanAndRepair,
+            _ => RunMode.ScanOnly
+        };
 
-        // ── Step 7: Throttle ──────────────────────────────────────────────────
-        AnsiConsole.WriteLine();
-        PrintStep(7, 7, "Throttling (production safety)");
-        AnsiConsole.MarkupLine("  Recommended defaults: PageSize=128, Delay=200 ms, Retries=3");
+        if (runMode is RunMode.ScanAndRepair or RunMode.DryRunRepair)
+            return (runMode, CheckMode.AllMismatches);
+
+        const string firstMismatch =
+            "First mismatch  [grey]— stop as soon as one inconsistency is found[/]";
+        const string allMismatches =
+            "All mismatches  [grey]— scan the entire dataset and collect every finding[/]";
+
+        var scanModeChoice = await new SelectionPrompt<string>()
+            .Title("  Select [cyan]scan termination strategy[/]:")
+            .AddChoices(firstMismatch, allMismatches)
+            .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
+
+        return (
+            runMode,
+            scanModeChoice == firstMismatch ? CheckMode.FirstMismatch : CheckMode.AllMismatches);
+    }
+
+    private static async Task<long> AskForStartEtagAsync(CancellationToken ct)
+    {
+        const string fromBeginning =
+            "Scan from the beginning  [grey]— ETag 0[/]";
+        const string fromSpecific =
+            "Start from a specific ETag  [grey]— skip older documents[/]";
+
+        var choice = await new SelectionPrompt<string>()
+            .Title("  Select [cyan]starting position[/]:")
+            .AddChoices(fromBeginning, fromSpecific)
+            .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
+
+        if (choice == fromBeginning)
+            return 0;
+
+        return await new TextPrompt<long>("  Enter the [cyan]starting ETag[/]:")
+            .Validate(value => value >= 0
+                ? ValidationResult.Success()
+                : ValidationResult.Error("[red]ETag must be >= 0.[/]"))
+            .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
+    }
+
+    private static async Task<ThrottleConfig> AskForThrottleAsync(CancellationToken ct)
+    {
+        AnsiConsole.MarkupLine("  Recommended defaults: PageSize=128, LookupBatchSize=512, Delay=200 ms, Retries=3");
 
         var useDefaults = await new ConfirmationPrompt("  Use recommended throttle [cyan]defaults[/]?")
             { DefaultValue = true }
             .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
 
-        ThrottleConfig throttle;
+        if (useDefaults)
+            return new ThrottleConfig();
+
+        var pageSize = await new TextPrompt<int>("    Page size [grey](items per node page, 1-1024)[/]:")
+            .DefaultValue(128)
+            .Validate(value => value is >= 1 and <= 1024
+                ? ValidationResult.Success()
+                : ValidationResult.Error("[red]Must be between 1 and 1024.[/]"))
+            .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
+
+        var clusterLookupBatchSize = await new TextPrompt<int>("    Cluster lookup batch size [grey](unique IDs, 1-4096)[/]:")
+            .DefaultValue(512)
+            .Validate(value => value is >= 1 and <= 4096
+                ? ValidationResult.Success()
+                : ValidationResult.Error("[red]Must be between 1 and 4096.[/]"))
+            .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
+
+        var delayMs = await new TextPrompt<int>("    Delay between pages [grey](ms, 0-60000)[/]:")
+            .DefaultValue(200)
+            .Validate(value => value is >= 0 and <= 60_000
+                ? ValidationResult.Success()
+                : ValidationResult.Error("[red]Must be between 0 and 60000.[/]"))
+            .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
+
+        var retries = await new TextPrompt<int>("    Max retries on transient errors [grey](1-10)[/]:")
+            .DefaultValue(3)
+            .Validate(value => value is >= 1 and <= 10
+                ? ValidationResult.Success()
+                : ValidationResult.Error("[red]Must be between 1 and 10.[/]"))
+            .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
+
+        return new ThrottleConfig
+        {
+            PageSize = pageSize,
+            ClusterLookupBatchSize = clusterLookupBatchSize,
+            DelayBetweenBatchesMs = delayMs,
+            MaxRetries = retries,
+            RetryBaseDelayMs = 500
+        };
+    }
+
+    private static async Task<bool> AskForServerCertificateValidationAsync(
+        IReadOnlyCollection<NodeConfig> nodes,
+        CancellationToken ct)
+    {
+        if (nodes.Any(node => node.Url.StartsWith("https://", StringComparison.OrdinalIgnoreCase)) == false)
+        {
+            AnsiConsole.MarkupLine("  [grey]Cluster node URLs use HTTP, so no TLS override is needed.[/]");
+            return false;
+        }
+
+        return await new ConfirmationPrompt(
+                "  Allow [yellow]invalid or self-signed server certificates[/] for cluster nodes? [grey](local test clusters only; unsafe for production)[/]")
+            { DefaultValue = false }
+            .ShowAsync(AnsiConsole.Console, ct)
+            .ConfigureAwait(false);
+    }
+
+    private static async Task<StateStoreConfig> AskForStateStoreAsync(CancellationToken ct)
+    {
+        var defaults = new StateStoreConfig();
+
+        AnsiConsole.MarkupLine(
+            $"  Default local RavenDB state store: [cyan]{defaults.ServerUrl}[/] / [cyan]{defaults.DatabaseName}[/]");
+
+        var useDefaults = await new ConfirmationPrompt("  Use the [cyan]default local RavenDB[/] state store?")
+            { DefaultValue = true }
+            .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
+
         if (useDefaults)
         {
-            throttle = new ThrottleConfig();
+            var diagnosticsEnabled = await new ConfirmationPrompt(
+                    "  Persist [cyan]structured diagnostics[/] to the state database?")
+                { DefaultValue = defaults.EnableDiagnostics }
+                .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
+
+            defaults.EnableDiagnostics = diagnosticsEnabled;
+            return defaults;
         }
-        else
-        {
-            var pageSize = await new TextPrompt<int>("    Page size [grey](documents per batch, 1-1024)[/]:")
-                .DefaultValue(128)
-                .Validate(v => v is >= 1 and <= 1024
-                    ? ValidationResult.Success()
-                    : ValidationResult.Error("[red]Must be between 1 and 1024.[/]"))
-                .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
 
-            var delayMs = await new TextPrompt<int>("    Delay between batches [grey](ms, 0-60000)[/]:")
-                .DefaultValue(200)
-                .Validate(v => v is >= 0 and <= 60_000
-                    ? ValidationResult.Success()
-                    : ValidationResult.Error("[red]Must be between 0 and 60000.[/]"))
-                .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
-
-            var retries = await new TextPrompt<int>("    Max retries on transient errors [grey](1-10)[/]:")
-                .DefaultValue(3)
-                .Validate(v => v is >= 1 and <= 10
-                    ? ValidationResult.Success()
-                    : ValidationResult.Error("[red]Must be between 1 and 10.[/]"))
-                .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
-
-            throttle = new ThrottleConfig
+        var serverUrl = await new TextPrompt<string>("    State store server URL [grey](http/https)[/]:")
+            .DefaultValue(defaults.ServerUrl)
+            .Validate(value =>
             {
-                PageSize             = pageSize,
-                DelayBetweenBatchesMs = delayMs,
-                MaxRetries           = retries,
-                RetryBaseDelayMs     = 500
-            };
-        }
+                if (!Uri.TryCreate(value, UriKind.Absolute, out var uri))
+                    return ValidationResult.Error("[red]Not a valid URI.[/]");
+                if (uri.Scheme != "http" && uri.Scheme != "https")
+                    return ValidationResult.Error("[red]Scheme must be http or https.[/]");
+                return ValidationResult.Success();
+            })
+            .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
 
-        // ── Assemble config ───────────────────────────────────────────────────
-        var config = new AppConfig
+        var databaseName = await new TextPrompt<string>("    State database name[/]:")
+            .DefaultValue(defaults.DatabaseName)
+            .Validate(value => string.IsNullOrWhiteSpace(value)
+                ? ValidationResult.Error("[red]Database name cannot be empty.[/]")
+                : ValidationResult.Success())
+            .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
+
+        var enableDiagnostics = await new ConfirmationPrompt(
+                "    Persist [cyan]structured diagnostics[/] to the state database?")
+            { DefaultValue = defaults.EnableDiagnostics }
+            .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
+
+        return new StateStoreConfig
         {
-            DatabaseName      = databaseName,
-            Nodes             = nodes,
-            SourceNodeIndex   = sourceIndex,
-            CertificatePath   = certPath,
-            CertificatePassword = certPassword,
-            Mode              = mode,
-            Throttle          = throttle
+            ServerUrl = serverUrl.TrimEnd('/'),
+            DatabaseName = databaseName,
+            EnableDiagnostics = enableDiagnostics
         };
-
-        // ── Step 8: Connectivity test ─────────────────────────────────────────
-        AnsiConsole.WriteLine();
-        AnsiConsole.MarkupLine("[bold]Testing connectivity to all nodes...[/]");
-
-        var allOk = await TestConnectivityAsync(config, ct).ConfigureAwait(false);
-
-        if (!allOk)
-        {
-            AnsiConsole.WriteLine();
-            var proceed = await new ConfirmationPrompt(
-                    "  [yellow]One or more nodes failed the connectivity test.[/] Continue anyway?")
-                { DefaultValue = false }
-                .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
-
-            if (!proceed)
-            {
-                AnsiConsole.MarkupLine("[red]Setup cancelled.[/]");
-                throw new OperationCanceledException("User cancelled after connectivity failure.");
-            }
-        }
-
-        // ── Step 9: Save and display summary ──────────────────────────────────
-        _store.SaveConfig(config);
-
-        AnsiConsole.WriteLine();
-        DisplayConfigSummary(config);
-        AnsiConsole.MarkupLine("[green]Configuration saved.[/]");
-        AnsiConsole.WriteLine();
-
-        return config;
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Completion wizard (pre-filled config support)
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Returns <c>true</c> when the configuration is fully specified and the scan can
-    /// start without additional wizard prompts.
-    /// </summary>
-    /// <remarks>
-    /// A <c>null</c> <see cref="AppConfig.CertificatePath"/> signals that a support
-    /// engineer pre-filled the config but intentionally left the certificate for the
-    /// customer to supply. An empty string means "no certificate required."
-    /// </remarks>
-    internal static bool IsConfigComplete(AppConfig config)
-        => config.CertificatePath != null;
-
-    /// <summary>
-    /// Completes a partially pre-filled <see cref="AppConfig"/> by asking only for
-    /// fields that were intentionally left unspecified (currently: the certificate).
-    /// Used when a support engineer ships <c>config.json</c> with cluster details
-    /// already filled in but without the customer's certificate path.
-    /// </summary>
-    /// <param name="config">
-    /// The partial configuration loaded from disk. Modified in-place and saved.
-    /// </param>
-    /// <param name="ct">Cancellation token for CTRL+C support.</param>
-    /// <returns>The completed and saved configuration.</returns>
-    public async Task<AppConfig> CompleteConfigAsync(AppConfig config, CancellationToken ct)
-    {
-        AnsiConsole.MarkupLine("[bold yellow]Configuration Completion[/]");
-        AnsiConsole.MarkupLine(
-            "[grey]A pre-filled configuration was found. " +
-            "Please supply the missing details below.[/]");
-        AnsiConsole.WriteLine();
-
-        DisplayConfigSummary(config);
-        AnsiConsole.WriteLine();
-
-        if (config.CertificatePath == null)
-        {
-            AnsiConsole.MarkupLine("[bold cyan]Certificate[/] — [bold]Client certificate[/]");
-            AnsiConsole.WriteLine();
-            var (certPath, certPassword) = AskForCertificate(ct);
-            config.CertificatePath   = certPath;
-            config.CertificatePassword = certPassword;
-        }
-
-        // ── Connectivity test ─────────────────────────────────────────────────
-        AnsiConsole.WriteLine();
-        AnsiConsole.MarkupLine("[bold]Testing connectivity to all nodes...[/]");
-
-        var allOk = await TestConnectivityAsync(config, ct).ConfigureAwait(false);
-
-        if (!allOk)
-        {
-            AnsiConsole.WriteLine();
-            var proceed = await new ConfirmationPrompt(
-                    "  [yellow]One or more nodes failed the connectivity test.[/] Continue anyway?")
-                { DefaultValue = false }
-                .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
-
-            if (!proceed)
-            {
-                AnsiConsole.MarkupLine("[red]Setup cancelled.[/]");
-                throw new OperationCanceledException("User cancelled after connectivity failure.");
-            }
-        }
-
-        _store.SaveConfig(config);
-
-        AnsiConsole.WriteLine();
-        DisplayConfigSummary(config);
-        AnsiConsole.MarkupLine("[green]Configuration saved.[/]");
-        AnsiConsole.WriteLine();
-
-        return config;
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Private helpers
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Interactively asks whether the cluster needs a certificate, and if so collects
-    /// the file path (with automatic quote stripping and native cursor movement via
-    /// <see cref="Console.ReadLine"/>) and the certificate password.
-    /// </summary>
-    /// <returns>
-    /// A tuple of (<c>certPath</c>, <c>certPassword</c>).
-    /// <c>certPath</c> is <see cref="string.Empty"/> when no certificate is required.
-    /// </returns>
     private static (string certPath, string certPassword) AskForCertificate(CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
+
         var needsCert = AnsiConsole.Confirm(
             "  Does the cluster require a [cyan]client certificate[/]?");
 
@@ -324,8 +443,7 @@ public sealed class ConfigWizard
             return (string.Empty, string.Empty);
 
         AnsiConsole.MarkupLine(
-            "  [grey]Tip: you may paste the path with surrounding quotes — " +
-            "they will be stripped automatically.[/]");
+            "  [grey]Tip: you may paste the path with surrounding quotes — they will be stripped automatically.[/]");
 
         string certPath;
         while (true)
@@ -342,7 +460,7 @@ public sealed class ConfigWizard
 
             if (!File.Exists(input))
             {
-                AnsiConsole.MarkupLine($"[red]    File not found: {input}[/]");
+                AnsiConsole.MarkupLine($"[red]    File not found: {Markup.Escape(input)}[/]");
                 continue;
             }
 
@@ -358,20 +476,13 @@ public sealed class ConfigWizard
         return (certPath, certPassword);
     }
 
-    /// <summary>
-    /// Performs a lightweight connectivity test against every configured node by
-    /// creating a temporary <see cref="IDocumentStore"/> (with
-    /// <c>DisableTopologyUpdates=true</c>) and executing an empty
-    /// <see cref="GetDocumentsCommand"/> as a ping.
-    /// </summary>
-    /// <returns>
-    /// <c>true</c> if every node responded successfully; <c>false</c> if any node failed.
-    /// </returns>
     private static async Task<bool> TestConnectivityAsync(AppConfig config, CancellationToken ct)
     {
-        X509Certificate2? cert = LoadCertificate(config);
-
         var results = new bool[config.Nodes.Count];
+        using var certificate = LoadCertificate(config);
+        using var certificateValidationScope = RavenCertificateValidationScope.Create(
+            config.Nodes.Select(node => node.Url),
+            config.AllowInvalidServerCertificates);
 
         await AnsiConsole.Progress()
             .AutoClear(false)
@@ -381,50 +492,39 @@ public sealed class ConfigWizard
                 new ElapsedTimeColumn())
             .StartAsync(async ctx =>
             {
-                var tasks = config.Nodes.Select((node, i) =>
+                var tasks = config.Nodes.Select((node, index) =>
                 {
                     var progressTask = ctx.AddTask($"  {node.Label} ({node.Url})");
-                    return TestNodeAsync(node, config.DatabaseName, cert, progressTask, ct)
-                        .ContinueWith(t =>
+                    return TestNodeAsync(node, config, certificate, progressTask, ct)
+                        .ContinueWith(task =>
                         {
-                            results[i] = t.IsCompletedSuccessfully && t.Result;
+                            results[index] = task.IsCompletedSuccessfully && task.Result;
                         }, TaskScheduler.Default);
                 }).ToList();
 
                 await Task.WhenAll(tasks).ConfigureAwait(false);
             }).ConfigureAwait(false);
 
-        cert?.Dispose();
-
-        // Print per-node result
         for (var i = 0; i < config.Nodes.Count; i++)
         {
-            var node   = config.Nodes[i];
             var status = results[i] ? "[green]✓ OK[/]" : "[red]✗ FAILED[/]";
-            AnsiConsole.MarkupLine($"  {status}  {node.Label} ({node.Url})");
+            AnsiConsole.MarkupLine($"  {status}  {Markup.Escape(config.Nodes[i].Label)} ({Markup.Escape(config.Nodes[i].Url)})");
         }
 
-        return results.All(r => r);
+        return results.All(result => result);
     }
 
-    /// <summary>
-    /// Tests connectivity to a single node. Returns <c>true</c> on success.
-    /// </summary>
     private static async Task<bool> TestNodeAsync(
         NodeConfig node,
-        string database,
-        X509Certificate2? cert,
+        AppConfig config,
+        X509Certificate2? certificate,
         ProgressTask progressTask,
         CancellationToken ct)
     {
         try
         {
-            using var store = BuildStore(node.Url, database, cert);
-
-            // GetStatisticsOperation is a lightweight GET to /databases/{db}/stats —
-            // the lightest SDK call that confirms the node is alive and the database exists.
-            await store.Maintenance.SendAsync(new GetStatisticsOperation(), ct)
-                       .ConfigureAwait(false);
+            using var store = BuildStore(node.Url, config.DatabaseName, certificate);
+            await store.Maintenance.SendAsync(new GetStatisticsOperation(), ct).ConfigureAwait(false);
 
             progressTask.Value = 100;
             progressTask.StopTask();
@@ -432,61 +532,120 @@ public sealed class ConfigWizard
         }
         catch (Exception ex)
         {
-            // Escape the message: RavenDB exceptions can contain square-bracket tokens
-            // (e.g. "[TIOAdapter]") that Spectre.Console would misinterpret as markup.
-            var safeMsg = Markup.Escape(ex.Message.Split('\n')[0]);
-            progressTask.Description = $"  [red]{Markup.Escape(node.Label)}: {safeMsg}[/]";
+            var safeMessage = Markup.Escape(ex.Message.Split('\n')[0]);
+            progressTask.Description = $"  [red]{Markup.Escape(node.Label)}: {safeMessage}[/]";
             progressTask.Value = 100;
             progressTask.StopTask();
             return false;
         }
     }
 
-    /// <summary>
-    /// Creates and initialises a pinned <see cref="IDocumentStore"/> for a single node.
-    /// <c>DisableTopologyUpdates=true</c> is critical: it prevents the client from
-    /// overwriting the pinned URL with the full cluster topology, which would cause
-    /// requests to be routed to unintended nodes.
-    /// </summary>
     internal static IDocumentStore BuildStore(string url, string database, X509Certificate2? cert)
     {
         return new DocumentStore
         {
-            Urls        = [url],
-            Database    = database,
+            Urls = [url],
+            Database = database,
             Certificate = cert,
             Conventions = new DocumentConventions
             {
-                DisableTopologyUpdates = true
+                DisableTopologyUpdates = true,
+                DisposeCertificate = false,
+                CreateHttpClient = handler =>
+                {
+                    handler.ClientCertificateOptions = ClientCertificateOption.Manual;
+                    return new HttpClient(handler, disposeHandler: true);
+                }
             }
         }.Initialize();
     }
 
-    /// <summary>
-    /// Loads the client certificate from the paths specified in
-    /// <paramref name="config"/>. Returns <c>null</c> if no certificate is configured.
-    /// </summary>
     internal static X509Certificate2? LoadCertificate(AppConfig config)
     {
+        if (!string.IsNullOrWhiteSpace(config.CertificateThumbprint))
+            return LoadCertificateFromCurrentUserStore(config.CertificateThumbprint);
+
         if (string.IsNullOrEmpty(config.CertificatePath))
             return null;
 
-        // Exportable: marks the private key as exportable so Windows SChannel (SCHANNEL.dll)
-        // can access the key material during TLS client-auth handshakes. Without this flag,
-        // the key is imported as non-exportable and TLS may fail with
-        // "m_safeCertContext is an invalid handle" or "No credentials are available".
-        const X509KeyStorageFlags certFlags = X509KeyStorageFlags.Exportable;
+        var password = string.IsNullOrEmpty(config.CertificatePassword)
+            ? null
+            : config.CertificatePassword;
 
-        return string.IsNullOrEmpty(config.CertificatePassword)
-            ? new X509Certificate2(config.CertificatePath, (string?)null, certFlags)
-            : new X509Certificate2(config.CertificatePath, config.CertificatePassword, certFlags);
+        var rawBytes = File.ReadAllBytes(config.CertificatePath);
+        const X509KeyStorageFlags baseFlags =
+            X509KeyStorageFlags.Exportable | X509KeyStorageFlags.PersistKeySet;
+
+        try
+        {
+            return EnsurePrivateKey(new X509Certificate2(
+                rawBytes,
+                password,
+                baseFlags | X509KeyStorageFlags.MachineKeySet));
+        }
+        catch (CryptographicException)
+        {
+            return EnsurePrivateKey(new X509Certificate2(
+                rawBytes,
+                password,
+                baseFlags | X509KeyStorageFlags.UserKeySet));
+        }
+
+        static X509Certificate2 EnsurePrivateKey(X509Certificate2 certificate)
+        {
+            _ = certificate.HasPrivateKey;
+            return certificate;
+        }
+
+        static X509Certificate2 LoadCertificateFromCurrentUserStore(string thumbprint)
+        {
+            var normalized = thumbprint.Replace(" ", string.Empty).ToUpperInvariant();
+
+            using var store = new X509Store(StoreName.My, StoreLocation.CurrentUser);
+            store.Open(OpenFlags.ReadOnly | OpenFlags.OpenExistingOnly);
+
+            var match = store.Certificates
+                .Find(X509FindType.FindByThumbprint, normalized, validOnly: false)
+                .OfType<X509Certificate2>()
+                .FirstOrDefault(certificate => certificate.HasPrivateKey);
+
+            if (match == null)
+            {
+                throw new InvalidOperationException(
+                    $"Client certificate with thumbprint '{normalized}' was not found in CurrentUser\\My or has no private key.");
+            }
+
+            _ = match.HasPrivateKey;
+            return match;
+        }
     }
 
-    /// <summary>Prints a numbered step header to the console.</summary>
+    private static bool HasCertificateConfiguration(AppConfig config)
+        => config.CertificatePath != null || !string.IsNullOrWhiteSpace(config.CertificateThumbprint);
+
+    private static bool NeedsCertificatePrompt(AppConfig config)
+        => !HasCertificateConfiguration(config) || config.MissingProperties.Contains("Certificate");
+
+    private static bool NeedsTlsValidationPrompt(AppConfig config)
+        => config.MissingProperties.Contains(nameof(AppConfig.AllowInvalidServerCertificates)) &&
+           config.Nodes.Any(node => node.Url.StartsWith("https://", StringComparison.OrdinalIgnoreCase));
+
+    private static bool NeedsRunModePrompt(AppConfig config)
+        => config.MissingProperties.Contains(nameof(AppConfig.RunMode)) ||
+           config.MissingProperties.Contains(nameof(AppConfig.Mode));
+
+    private static bool NeedsThrottlePrompt(AppConfig config)
+        => config.MissingProperties.Contains(nameof(AppConfig.Throttle));
+
+    private static bool NeedsStateStorePrompt(AppConfig config)
+        => config.MissingProperties.Contains(nameof(AppConfig.StateStore));
+
+    private static bool NeedsStartEtagPrompt(AppConfig config)
+        => !config.StartEtag.HasValue || config.MissingProperties.Contains(nameof(AppConfig.StartEtag));
+
     private static void PrintStep(int step, int total, string title) =>
         AnsiConsole.MarkupLine($"[bold cyan]Step {step}/{total}[/] — [bold]{title}[/]");
 
-    /// <summary>Renders a summary table of the completed configuration.</summary>
     internal static void DisplayConfigSummary(AppConfig config)
     {
         var table = new Table()
@@ -494,24 +653,100 @@ public sealed class ConfigWizard
             .AddColumn("[grey]Setting[/]")
             .AddColumn("[grey]Value[/]");
 
-        table.AddRow("Database",    $"[cyan]{config.DatabaseName}[/]");
-        table.AddRow("Scan mode",   $"[cyan]{config.Mode}[/]");
-        table.AddRow("Source node", $"[cyan]{config.SourceNode.Label}[/]  ({config.SourceNode.Url})");
+        table.AddRow("Database", $"[cyan]{Markup.Escape(config.DatabaseName)}[/]");
+        table.AddRow(
+            "Run mode",
+            config.MissingProperties.Contains(nameof(AppConfig.RunMode))
+                ? "[yellow]not specified[/]"
+                : config.RunMode switch
+                {
+                    RunMode.ScanOnly => "[cyan]Scan only[/]",
+                    RunMode.DryRunRepair => "[cyan]Dry-run repair[/]",
+                    RunMode.ScanAndRepair => "[cyan]Scan and repair[/]",
+                    _ => $"[cyan]{config.RunMode}[/]"
+                });
+        table.AddRow(
+            "Scan mode",
+            config.MissingProperties.Contains(nameof(AppConfig.Mode))
+                ? "[yellow]not specified[/]"
+                : config.RunMode switch
+                {
+                    RunMode.ScanAndRepair => "[grey]Full traversal (repair mode)[/]",
+                    RunMode.DryRunRepair => "[grey]Full traversal (dry-run repair mode)[/]",
+                    _ => $"[cyan]{config.Mode}[/]"
+                });
+        table.AddRow(
+            "Start ETag",
+            NeedsStartEtagPrompt(config)
+                ? "[yellow]not specified[/]"
+                : config.StartEtag.GetValueOrDefault() switch
+            {
+                0 => "[grey]0 (scan from the beginning)[/]",
+                var startEtag => $"[cyan]{startEtag:N0}[/]"
+            });
 
-        var targets = config.TargetNodes.ToList();
-        for (var i = 0; i < targets.Count; i++)
-            table.AddRow(i == 0 ? "Target node(s)" : string.Empty,
-                $"[cyan]{targets[i].Label}[/]  ({targets[i].Url})");
+        for (var i = 0; i < config.Nodes.Count; i++)
+        {
+            var node = config.Nodes[i];
+            table.AddRow(
+                i == 0 ? "Cluster nodes" : string.Empty,
+                $"[cyan]{Markup.Escape(node.Label)}[/]  ({Markup.Escape(node.Url)})");
+        }
 
-        table.AddRow("Certificate",
-            config.CertificatePath == null    ? "[yellow]not specified[/]" :
-            config.CertificatePath.Length == 0 ? "[grey]none (open cluster)[/]" :
-                                                 $"[cyan]{Path.GetFileName(config.CertificatePath)}[/]");
+        table.AddRow(
+            "Certificate",
+            GetCertificateSummary(config));
+        table.AddRow(
+            "Server cert validation",
+            NeedsTlsValidationPrompt(config)
+                ? "[yellow]not specified[/]"
+                : config.AllowInvalidServerCertificates
+                ? "[yellow]allow invalid (dev/test only)[/]"
+                : "[green]strict[/]");
 
-        table.AddRow("Page size",   $"[cyan]{config.Throttle.PageSize}[/] docs/batch");
-        table.AddRow("Batch delay", $"[cyan]{config.Throttle.DelayBetweenBatchesMs}[/] ms");
-        table.AddRow("Max retries", $"[cyan]{config.Throttle.MaxRetries}[/]");
+        table.AddRow(
+            "Page size",
+            NeedsThrottlePrompt(config)
+                ? "[yellow]not specified[/]"
+                : $"[cyan]{config.Throttle.PageSize}[/] items");
+        table.AddRow(
+            "Lookup batch",
+            NeedsThrottlePrompt(config)
+                ? "[yellow]not specified[/]"
+                : $"[cyan]{config.Throttle.ClusterLookupBatchSize}[/] unique IDs");
+        table.AddRow(
+            "Page delay",
+            NeedsThrottlePrompt(config)
+                ? "[yellow]not specified[/]"
+                : $"[cyan]{config.Throttle.DelayBetweenBatchesMs}[/] ms");
+        table.AddRow(
+            "Max retries",
+            NeedsThrottlePrompt(config)
+                ? "[yellow]not specified[/]"
+                : $"[cyan]{config.Throttle.MaxRetries}[/]");
+        table.AddRow(
+            "State store",
+            NeedsStateStorePrompt(config)
+                ? "[yellow]not specified[/]"
+                : $"[cyan]{Markup.Escape(config.StateStore.ServerUrl)}[/] / [cyan]{Markup.Escape(config.StateStore.DatabaseName)}[/]");
+        table.AddRow(
+            "Diagnostics",
+            NeedsStateStorePrompt(config)
+                ? "[yellow]not specified[/]"
+                : config.StateStore.EnableDiagnostics ? "[green]enabled[/]" : "[grey]disabled[/]");
 
         AnsiConsole.Write(table);
+    }
+
+    private static string GetCertificateSummary(AppConfig config)
+    {
+        if (!string.IsNullOrWhiteSpace(config.CertificateThumbprint))
+            return $"[cyan]CurrentUser\\\\My[/]  [grey]{Markup.Escape(config.CertificateThumbprint)}[/]";
+
+        return config.CertificatePath == null
+            ? "[yellow]not specified[/]"
+            : config.CertificatePath.Length == 0
+                ? "[grey]none (open cluster)[/]"
+                : $"[cyan]{Markup.Escape(Path.GetFileName(config.CertificatePath))}[/]";
     }
 }

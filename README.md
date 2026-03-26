@@ -61,6 +61,7 @@ that are missing or incomplete.
   "CertificatePath": "C:\\path\\to\\client.certificate.pfx",
   "CertificatePassword": "",
   "Mode": "FirstMismatch",
+  "StartEtag": 250000,
   "Throttle": {
     "PageSize": 128,
     "DelayBetweenBatchesMs": 200,
@@ -78,6 +79,7 @@ that are missing or incomplete.
 | `CertificatePath` | Path to the client certificate `.pfx` / `.p12` file. Set to `""` for open (non-authenticated) clusters. Omit or set to `null` to have the wizard ask for it. |
 | `CertificatePassword` | Password for the certificate file. Can be empty if the certificate has no password. |
 | `Mode` | `FirstMismatch` — stop at the first detected inconsistency (fast triage). `AllMismatches` — scan the full database and collect every inconsistency. |
+| `StartEtag` | Starting ETag for a fresh scan. Set to `0` to scan from the beginning, set a positive value to skip older documents, or omit / set to `null` to have the wizard ask for it. |
 | `Throttle.PageSize` | Documents fetched per batch (1–1024, default: 128). |
 | `Throttle.DelayBetweenBatchesMs` | Pause between batches in milliseconds (0–60000, default: 200). Increase to reduce cluster load. |
 | `Throttle.MaxRetries` | Retry attempts for failed HTTP/SDK calls (1–10, default: 3). |

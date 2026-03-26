@@ -1,220 +1,125 @@
 using ConsistencyCheck;
 using Spectre.Console;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Banner
-// ─────────────────────────────────────────────────────────────────────────────
-
 AnsiConsole.Write(new FigletText("ConsistencyCheck").Color(Color.CornflowerBlue));
-AnsiConsole.MarkupLine("[grey]RavenDB Cluster Consistency Checker  v1.0[/]");
-AnsiConsole.MarkupLine("[grey]Compares document change vectors across all cluster nodes.[/]");
+AnsiConsole.MarkupLine("[grey]RavenDB Cluster Consistency Checker  v2.0[/]");
+AnsiConsole.MarkupLine("[grey]Symmetric full-pass scan with local RavenDB state storage.[/]");
 AnsiConsole.WriteLine();
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Graceful CTRL+C
-// Cancellation is signalled here; the current batch will finish before the
-// application exits so that progress is never lost.
-// ─────────────────────────────────────────────────────────────────────────────
 
 using var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) =>
 {
-    // Cancel the token instead of terminating immediately.
     e.Cancel = true;
-    AnsiConsole.MarkupLine("\n[yellow]Interrupt received — exiting…[/]");
+    AnsiConsole.MarkupLine("\n[yellow]Interrupt received — exiting after the current in-flight work finishes…[/]");
     cts.Cancel();
 };
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Output directory  (./output/ next to the executable)
-// ─────────────────────────────────────────────────────────────────────────────
 
 var outputDir = Path.Combine(AppContext.BaseDirectory, "output");
 Directory.CreateDirectory(outputDir);
 
 var progressStore = new ProgressStore(outputDir);
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Configuration: load saved config or run the setup wizard
-// ─────────────────────────────────────────────────────────────────────────────
-
 try
 {
+    var resolved = await ResolveRunContextAsync(progressStore, cts.Token);
+    await using var stateStore = resolved.StateStore;
 
-AppConfig config;
-ProgressState progress;
+    var config = resolved.Config;
+    var run = resolved.Run;
+    var semanticsSnapshot = run.ChangeVectorSemanticsSnapshot
+        ?? throw new InvalidOperationException("Run is missing the change-vector semantics snapshot.");
 
-if (progressStore.ConfigExists)
-{
-    // ── Load and display existing configuration ───────────────────────────────
-    try
-    {
-        config = progressStore.LoadConfig();
-    }
-    catch (InvalidOperationException ex)
-    {
-        AnsiConsole.MarkupLine($"[red]Failed to load configuration: {Markup.Escape(ex.Message)}[/]");
-        AnsiConsole.MarkupLine("[yellow]Starting the setup wizard to reconfigure…[/]");
-        AnsiConsole.WriteLine();
+    using var certificateValidationScope = RavenCertificateValidationScope.Create(
+        config.Nodes.Select(node => node.Url),
+        config.AllowInvalidServerCertificates);
 
-        config = await new ConfigWizard(progressStore).RunAsync(cts.Token);
-        progressStore.DeleteProgress();
-        progress = new ProgressState();
-        goto RunScan;
-    }
+    await RuntimeConnectivityValidator.ValidateAsync(config, cts.Token);
 
-    // ── Pre-filled config: ask only for missing fields ────────────────────────
-    if (!ConfigWizard.IsConfigComplete(config))
-    {
-        AnsiConsole.MarkupLine(
-            "[yellow]Pre-filled configuration found — please provide the missing details.[/]");
-        AnsiConsole.WriteLine();
-        config = await new ConfigWizard(progressStore).CompleteConfigAsync(config, cts.Token);
-        progressStore.DeleteProgress();
-        progress = new ProgressState();
-        goto RunScan;
-    }
-
-    AnsiConsole.MarkupLine("[green]Loaded existing configuration.[/]");
     AnsiConsole.WriteLine();
-    ConfigWizard.DisplayConfigSummary(config);
+    AnsiConsole.Write(new Rule("[bold green]Starting symmetric scan[/]").RuleStyle("green"));
+    AnsiConsole.MarkupLine($"  Database        : [cyan]{Markup.Escape(config.DatabaseName)}[/]");
+    AnsiConsole.MarkupLine($"  Run mode        : [cyan]{DescribeRunMode(config.RunMode)}[/]");
+    AnsiConsole.MarkupLine($"  Traversal       : [cyan]Full pass on every node[/]");
+    AnsiConsole.MarkupLine($"  Nodes           : [cyan]{string.Join(", ", config.Nodes.Select(node => node.Label))}[/]");
+    AnsiConsole.MarkupLine($"  Page size       : [cyan]{config.Throttle.PageSize}[/]   Lookup batch: [cyan]{config.Throttle.ClusterLookupBatchSize}[/]");
+    AnsiConsole.MarkupLine($"  Delay           : [cyan]{config.Throttle.DelayBetweenBatchesMs}[/] ms   Retries: [cyan]{config.Throttle.MaxRetries}[/]");
+    AnsiConsole.MarkupLine(
+        $"  Server certs    : {(config.AllowInvalidServerCertificates ? "[yellow]allow invalid (dev/test only)[/]" : "[green]strict[/]")}");
+    AnsiConsole.MarkupLine(
+        $"  Explicit unused : [cyan]{Markup.Escape(DescribeIdList(semanticsSnapshot.ExplicitUnusedDatabaseIds))}[/]");
+    AnsiConsole.MarkupLine(
+        $"  Potential unused: {(semanticsSnapshot.PotentialUnusedDatabaseIds.Count == 0
+            ? "[green]none[/]"
+            : $"[yellow]{Markup.Escape(DescribeIdList(semanticsSnapshot.PotentialUnusedDatabaseIds))}[/] [grey](warning only)[/]")}");
+    AnsiConsole.MarkupLine($"  State store     : [cyan]{Markup.Escape(config.StateStore.ServerUrl)}[/] / [cyan]{Markup.Escape(config.StateStore.DatabaseName)}[/]");
+    AnsiConsole.MarkupLine($"  Run ID          : [cyan]{Markup.Escape(run.RunId)}[/]");
     AnsiConsole.WriteLine();
 
-    // ── Resume / restart / reconfigure prompt ─────────────────────────────────
-    if (progressStore.ProgressExists)
-    {
-        progress = progressStore.LoadProgress();
+    RunStateDocument finalRun = run;
+    await using var checker = new ConsistencyChecker(config, stateStore);
 
-        if (!progress.IsComplete)
-        {
-            var resumeLabel = $"Resume from ETag {progress.LastProcessedEtag ?? 0:N0}" +
-                              $"  ({progress.DocumentsInspected:N0} docs already inspected," +
-                              $" {progress.MismatchesFound:N0} mismatches found)";
-
-            var choice = await new SelectionPrompt<string>()
-                    .Title("[bold]A previous scan is in progress. What would you like to do?[/]")
-                    .AddChoices(resumeLabel, "Restart scan from the beginning", "Reconfigure (run wizard again)")
-                    .ShowAsync(AnsiConsole.Console, cts.Token);
-
-            if (choice.StartsWith("Restart"))
-            {
-                progressStore.DeleteProgress();
-                progress = new ProgressState();
-            }
-            else if (choice.StartsWith("Reconfigure"))
-            {
-                AnsiConsole.WriteLine();
-                config = await new ConfigWizard(progressStore).RunAsync(cts.Token);
-                progressStore.DeleteProgress();
-                progress = new ProgressState();
-            }
-            // else: resume — progress is already loaded, use it as-is
-        }
-        else
-        {
-            // Previous scan completed normally.
-            AnsiConsole.MarkupLine("[green]Previous scan completed.[/] Starting a fresh scan.");
-            progressStore.DeleteProgress();
-            progress = new ProgressState();
-        }
-    }
-    else
-    {
-        progress = new ProgressState();
-    }
-}
-else
-{
-    // First run — no config.json found.
-    AnsiConsole.MarkupLine("[yellow]No configuration found. Launching setup wizard…[/]");
-    AnsiConsole.WriteLine();
-    config   = await new ConfigWizard(progressStore).RunAsync(cts.Token);
-    progress = new ProgressState();
-}
-
-RunScan:
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Scan header
-// ─────────────────────────────────────────────────────────────────────────────
-
-AnsiConsole.WriteLine();
-AnsiConsole.Write(new Rule("[bold green]Starting consistency scan[/]").RuleStyle("green"));
-AnsiConsole.MarkupLine($"  Database  : [cyan]{config.DatabaseName}[/]");
-AnsiConsole.MarkupLine($"  Mode      : [cyan]{config.Mode}[/]");
-AnsiConsole.MarkupLine($"  Source    : [cyan]{config.SourceNode.Label}[/]  ({config.SourceNode.Url})");
-AnsiConsole.MarkupLine($"  Targets   : [cyan]{string.Join(", ", config.TargetNodes.Select(n => n.Label))}[/]");
-AnsiConsole.MarkupLine($"  Page size : [cyan]{config.Throttle.PageSize}[/] docs   Delay: [cyan]{config.Throttle.DelayBetweenBatchesMs}[/] ms");
-if (progress.LastProcessedEtag.HasValue)
-    AnsiConsole.MarkupLine($"  Resuming from ETag [cyan]{progress.LastProcessedEtag}[/]");
-AnsiConsole.WriteLine();
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Run the checker
-// ─────────────────────────────────────────────────────────────────────────────
-
-ProgressState finalState = progress;
-
-await using var writer  = new ResultsWriter(outputDir);
-await using var checker = new ConsistencyChecker(config, progressStore, writer);
-
-// Fetch the current highest ETag for the progress bar (best-effort; null = indeterminate).
-var maxEtag = await checker.FetchMaxEtagAsync(cts.Token);
-
-try
-{
     await AnsiConsole.Progress()
         .AutoClear(false)
         .HideCompleted(false)
         .Columns(
             new SpinnerColumn(),
             new TaskDescriptionColumn { Alignment = Justify.Left },
-            new ProgressBarColumn(),
-            new PercentageColumn(),
-            new ElapsedTimeColumn(),
-            new RemainingTimeColumn())
-        .StartAsync(async ctx =>
+            new ElapsedTimeColumn())
+        .StartAsync(async context =>
         {
-            var task = ctx.AddTask("Scanning…", maxValue: (double)(maxEtag ?? 100));
-            if (!maxEtag.HasValue)
-                task.IsIndeterminate(true);
-            else if (progress.LastProcessedEtag.HasValue)
-                task.Value = progress.LastProcessedEtag.Value; // seed resume position
+            var task = context.AddTask("Scanning…");
+            task.IsIndeterminate(true);
 
-            checker.BatchCompleted += async (inspected, mismatches, etag) =>
+            checker.ProgressUpdated += update =>
             {
-                // Live description: running doc count and mismatch count.
-                var mismatchText = mismatches > 0
-                    ? $"[red]{mismatches:N0} mismatches[/]"
-                    : "[green]0 mismatches[/]";
-                task.Description = $"[cyan]{inspected:N0}[/] docs  {mismatchText}";
+                var nodeText = string.IsNullOrWhiteSpace(update.CurrentNodeLabel)
+                    ? "finishing"
+                    : $"node [cyan]{Markup.Escape(update.CurrentNodeLabel)}[/]";
 
-                // If the DB grew beyond our snapshot, re-fetch the ceiling once.
-                if (maxEtag.HasValue && etag > maxEtag.Value)
+                var repairText = config.RunMode switch
                 {
-                    var refreshed = await checker.FetchMaxEtagAsync(CancellationToken.None);
-                    if (refreshed.HasValue && refreshed.Value > task.MaxValue)
-                        task.MaxValue = refreshed.Value;
-                    maxEtag = refreshed ?? maxEtag;
-                }
+                    RunMode.ScanAndRepair =>
+                        $"  repairs [green]{update.RepairsPatchedOnWinner:N0}[/]/[yellow]{update.RepairsAttempted:N0}[/]/[red]{update.RepairsFailed:N0}[/]",
+                    RunMode.DryRunRepair =>
+                        $"  planned [yellow]{update.RepairsPlanned:N0}[/]",
+                    _ => string.Empty
+                };
 
-                task.Value = maxEtag.HasValue
-                    ? Math.Min((double)etag, task.MaxValue)
-                    : task.Value + 1; // indeterminate: just tick forward
+                task.Description =
+                    $"{nodeText}  docs [cyan]{update.DocumentsInspected:N0}[/]  versions [cyan]{update.UniqueVersionsCompared:N0}[/]  mismatches [red]{update.MismatchesFound:N0}[/]{repairText}";
             };
 
-            finalState = await checker.RunAsync(progress, cts.Token);
+            finalRun = await checker.RunAsync(run, cts.Token).ConfigureAwait(false);
+            task.Value = task.MaxValue;
+        }).ConfigureAwait(false);
 
-            // Ensure the bar reaches 100 % on a clean finish.
-            if (finalState.IsComplete)
-                task.Value = task.MaxValue;
-        });
+    AnsiConsole.WriteLine();
+    var statusMarkup = finalRun.IsComplete
+        ? "[bold green]Complete[/]"
+        : "[bold yellow]Interrupted / stopped early[/]";
+
+    var summary = new Panel(
+            $"[grey]Documents inspected      :[/] [bold]{finalRun.DocumentsInspected:N0}[/]\n" +
+            $"[grey]Unique versions compared :[/] [bold]{finalRun.UniqueVersionsCompared:N0}[/]\n" +
+            $"[grey]Mismatches found         :[/] [bold red]{finalRun.MismatchesFound:N0}[/]\n" +
+            $"[grey]Repairs planned         :[/] [bold yellow]{finalRun.RepairsPlanned:N0}[/]\n" +
+            $"[grey]Repairs attempted       :[/] [bold]{finalRun.RepairsAttempted:N0}[/]\n" +
+            $"[grey]Repairs patched winner  :[/] [bold green]{finalRun.RepairsPatchedOnWinner:N0}[/]\n" +
+            $"[grey]Repairs failed          :[/] [bold red]{finalRun.RepairsFailed:N0}[/]\n" +
+            $"[grey]Run status              :[/] {statusMarkup}\n" +
+            $"[grey]Safe restart ETag       :[/] [cyan]{finalRun.SafeRestartEtag?.ToString("N0") ?? "n/a"}[/]\n" +
+            $"[grey]State store             :[/] [cyan]{Markup.Escape(config.StateStore.ServerUrl)}[/] / [cyan]{Markup.Escape(config.StateStore.DatabaseName)}[/]\n" +
+            $"[grey]Run ID                  :[/] [cyan]{Markup.Escape(finalRun.RunId)}[/]")
+        .Header("[bold]Run Summary[/]")
+        .Border(BoxBorder.Rounded)
+        .Padding(1, 0);
+
+    AnsiConsole.Write(summary);
 }
 catch (OperationCanceledException)
 {
-    // CTRL+C — progress has already been saved inside RunAsync.
     AnsiConsole.WriteLine();
-    AnsiConsole.MarkupLine("[yellow]Scan interrupted — progress saved.[/]");
+    AnsiConsole.MarkupLine("[yellow]Run interrupted. Exact per-node cursors remain saved in the local RavenDB state store.[/]");
 }
 catch (Exception ex)
 {
@@ -223,41 +128,218 @@ catch (Exception ex)
     AnsiConsole.WriteException(ex, ExceptionFormats.ShortenPaths | ExceptionFormats.ShowLinks);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Final summary
-// ─────────────────────────────────────────────────────────────────────────────
+return;
 
-AnsiConsole.WriteLine();
-
-var statusMarkup = finalState.IsComplete
-    ? "[bold green]Complete[/]"
-    : "[bold yellow]Interrupted / stopped early[/]";
-
-var mismatchSummary = finalState.MismatchesFound > 0
-    ? $"[bold red]{finalState.MismatchesFound:N0}[/]"
-    : "[bold green]0 — cluster is consistent![/]";
-
-var summaryPanel = new Panel(
-    $"[grey]Documents inspected :[/] [bold]{finalState.DocumentsInspected:N0}[/]\n" +
-    $"[grey]Mismatches found    :[/] {mismatchSummary}\n" +
-    $"[grey]Scan status         :[/] {statusMarkup}\n" +
-    $"[grey]Output directory    :[/] [cyan]{outputDir}[/]")
-    .Header("[bold]Scan Summary[/]")
-    .Border(BoxBorder.Rounded)
-    .Padding(1, 0);
-
-AnsiConsole.Write(summaryPanel);
-
-if (finalState.MismatchesFound > 0)
+static async Task<ResolvedRunContext> ResolveRunContextAsync(ProgressStore progressStore, CancellationToken ct)
 {
-    AnsiConsole.WriteLine();
-    AnsiConsole.MarkupLine(
-        $"[yellow]Mismatch details have been written to [cyan]mismatches_*.csv[/] " +
-        $"in the output directory.[/]");
+    while (true)
+    {
+        var config = await LoadOrConfigureConfigAsync(progressStore, ct).ConfigureAwait(false);
+        var stateStore = new StateStore(config.StateStore);
+
+        try
+        {
+            await stateStore.EnsureDatabaseExistsAsync(ct).ConfigureAwait(false);
+
+            var selection = await SelectRunAsync(config, progressStore, stateStore, ct).ConfigureAwait(false);
+            if (selection.Reconfigure)
+            {
+                await stateStore.DisposeAsync().ConfigureAwait(false);
+                continue;
+            }
+
+            var run = selection.Run!;
+            var semanticsSnapshot = await ChangeVectorSemantics.EnsureSnapshotAsync(
+                    run,
+                    token => ChangeVectorSemanticsResolver.ResolveAsync(config, token),
+                    (savedRun, token) => stateStore.SaveRunAsync(savedRun, token),
+                    ct)
+                .ConfigureAwait(false);
+
+            await stateStore.StoreDiagnosticsAsync(
+                    [ChangeVectorSemantics.CreateDiagnostic(run.RunId, semanticsSnapshot)],
+                    ct)
+                .ConfigureAwait(false);
+
+            return new ResolvedRunContext(config, stateStore, run);
+        }
+        catch
+        {
+            await stateStore.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+    }
 }
 
-} // end try
-catch (OperationCanceledException)
+static async Task<AppConfig> LoadOrConfigureConfigAsync(ProgressStore progressStore, CancellationToken ct)
 {
-    AnsiConsole.MarkupLine("[yellow]Interrupted — exiting.[/]");
+    if (!progressStore.ConfigExists)
+    {
+        AnsiConsole.MarkupLine("[yellow]No configuration found. Launching setup wizard…[/]");
+        AnsiConsole.WriteLine();
+        return await new ConfigWizard(progressStore).RunAsync(ct).ConfigureAwait(false);
+    }
+
+    try
+    {
+        var config = progressStore.LoadConfig();
+        if (!ConfigWizard.IsConfigComplete(config))
+        {
+            AnsiConsole.MarkupLine("[yellow]Pre-filled configuration found — please provide the missing details.[/]");
+            AnsiConsole.WriteLine();
+            return await new ConfigWizard(progressStore).CompleteConfigAsync(config, ct).ConfigureAwait(false);
+        }
+
+        AnsiConsole.MarkupLine("[green]Loaded existing configuration.[/]");
+        AnsiConsole.WriteLine();
+        ConfigWizard.DisplayConfigSummary(config);
+        AnsiConsole.WriteLine();
+        return config;
+    }
+    catch (InvalidOperationException ex)
+    {
+        AnsiConsole.MarkupLine($"[red]Failed to load configuration: {Markup.Escape(ex.Message)}[/]");
+        AnsiConsole.MarkupLine("[yellow]Starting the setup wizard to reconfigure…[/]");
+        AnsiConsole.WriteLine();
+        return await new ConfigWizard(progressStore).RunAsync(ct).ConfigureAwait(false);
+    }
 }
+
+static async Task<RunSelection> SelectRunAsync(
+    AppConfig config,
+    ProgressStore progressStore,
+    StateStore stateStore,
+    CancellationToken ct)
+{
+    var runHead = await stateStore.LoadRunHeadAsync(config.DatabaseName, ct).ConfigureAwait(false);
+    RunStateDocument? latestRun = null;
+    if (!string.IsNullOrWhiteSpace(runHead?.LatestRunId))
+        latestRun = await stateStore.LoadRunAsync(runHead.LatestRunId, ct).ConfigureAwait(false);
+
+    if (latestRun != null && !latestRun.IsComplete)
+    {
+        var choices = new List<string>
+        {
+            $"Resume interrupted run  [grey]— exact per-node cursors, {latestRun.DocumentsInspected:N0} docs, {latestRun.MismatchesFound:N0} mismatches[/]"
+        };
+
+        if (runHead?.LastCompletedSafeRestartEtag is long completedFrontier)
+            choices.Add($"Start from last completed frontier  [grey]— ETag {completedFrontier:N0}[/]");
+
+        choices.Add(GetConfiguredStartLabel(config));
+        choices.Add("Start from a specific ETag");
+        choices.Add("Reconfigure (run wizard again)");
+
+        var choice = await new SelectionPrompt<string>()
+            .Title("[bold]A previous run exists. What would you like to do?[/]")
+            .AddChoices(choices)
+            .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
+
+        if (choice.StartsWith("Resume interrupted run", StringComparison.Ordinal))
+            return new RunSelection(latestRun, false);
+
+        if (choice.StartsWith("Start from last completed frontier", StringComparison.Ordinal) &&
+            runHead?.LastCompletedSafeRestartEtag is long restartEtag)
+        {
+            var semanticsSnapshot = await ChangeVectorSemanticsResolver.ResolveAsync(config, ct).ConfigureAwait(false);
+            var run = await stateStore.CreateRunAsync(config, restartEtag, semanticsSnapshot, ct).ConfigureAwait(false);
+            return new RunSelection(run, false);
+        }
+
+        if (choice == GetConfiguredStartLabel(config))
+        {
+            var semanticsSnapshot = await ChangeVectorSemanticsResolver.ResolveAsync(config, ct).ConfigureAwait(false);
+            var run = await stateStore.CreateRunAsync(config, config.StartEtag ?? 0, semanticsSnapshot, ct).ConfigureAwait(false);
+            return new RunSelection(run, false);
+        }
+
+        if (choice.StartsWith("Start from a specific ETag", StringComparison.Ordinal))
+        {
+            var startEtag = await AskForCustomStartEtagAsync(ct).ConfigureAwait(false);
+            var semanticsSnapshot = await ChangeVectorSemanticsResolver.ResolveAsync(config, ct).ConfigureAwait(false);
+            var run = await stateStore.CreateRunAsync(config, startEtag, semanticsSnapshot, ct).ConfigureAwait(false);
+            return new RunSelection(run, false);
+        }
+
+        return new RunSelection(null, true);
+    }
+
+    if (runHead?.LastCompletedSafeRestartEtag is long safeRestartEtag)
+    {
+        var choice = await new SelectionPrompt<string>()
+            .Title("[bold]How would you like to start the next run?[/]")
+            .AddChoices(
+                $"Start from last completed frontier  [grey]— ETag {safeRestartEtag:N0}[/]",
+                GetConfiguredStartLabel(config),
+                "Start from a specific ETag",
+                "Reconfigure (run wizard again)")
+            .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
+
+        if (choice.StartsWith("Start from last completed frontier", StringComparison.Ordinal))
+        {
+            var semanticsSnapshot = await ChangeVectorSemanticsResolver.ResolveAsync(config, ct).ConfigureAwait(false);
+            var run = await stateStore.CreateRunAsync(config, safeRestartEtag, semanticsSnapshot, ct).ConfigureAwait(false);
+            return new RunSelection(run, false);
+        }
+
+        if (choice == GetConfiguredStartLabel(config))
+        {
+            var semanticsSnapshot = await ChangeVectorSemanticsResolver.ResolveAsync(config, ct).ConfigureAwait(false);
+            var run = await stateStore.CreateRunAsync(config, config.StartEtag ?? 0, semanticsSnapshot, ct).ConfigureAwait(false);
+            return new RunSelection(run, false);
+        }
+
+        if (choice.StartsWith("Start from a specific ETag", StringComparison.Ordinal))
+        {
+            var startEtag = await AskForCustomStartEtagAsync(ct).ConfigureAwait(false);
+            var semanticsSnapshot = await ChangeVectorSemanticsResolver.ResolveAsync(config, ct).ConfigureAwait(false);
+            var run = await stateStore.CreateRunAsync(config, startEtag, semanticsSnapshot, ct).ConfigureAwait(false);
+            return new RunSelection(run, false);
+        }
+
+        return new RunSelection(null, true);
+    }
+
+    var freshSemanticsSnapshot = await ChangeVectorSemanticsResolver.ResolveAsync(config, ct).ConfigureAwait(false);
+    var freshRun = await stateStore.CreateRunAsync(config, config.StartEtag ?? 0, freshSemanticsSnapshot, ct).ConfigureAwait(false);
+    return new RunSelection(freshRun, false);
+}
+
+static string GetConfiguredStartLabel(AppConfig config)
+{
+    return config.StartEtag switch
+    {
+        null => "Start from configured start ETag  [grey]— not specified[/]",
+        0 => "Start from configured start ETag  [grey]— ETag 0[/]",
+        _ => $"Start from configured start ETag  [grey]— ETag {config.StartEtag.Value:N0}[/]"
+    };
+}
+
+static async Task<long> AskForCustomStartEtagAsync(CancellationToken ct)
+{
+    return await new TextPrompt<long>("  Enter the [cyan]starting ETag[/]:")
+        .Validate(value => value >= 0
+            ? ValidationResult.Success()
+            : ValidationResult.Error("[red]ETag must be >= 0.[/]"))
+        .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
+}
+
+static string DescribeRunMode(RunMode runMode) => runMode switch
+{
+    RunMode.ScanOnly => "Scan only",
+    RunMode.DryRunRepair => "Dry-run repair",
+    RunMode.ScanAndRepair => "Scan and repair",
+    _ => runMode.ToString()
+};
+
+static string DescribeIdList(IReadOnlyCollection<string> ids)
+{
+    if (ids.Count == 0)
+        return "none";
+
+    return string.Join(", ", ids);
+}
+
+file sealed record ResolvedRunContext(AppConfig Config, StateStore StateStore, RunStateDocument Run);
+
+file sealed record RunSelection(RunStateDocument? Run, bool Reconfigure);
