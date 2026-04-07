@@ -7,7 +7,7 @@ internal static class RuntimeConnectivityValidator
 {
     public static async Task ValidateAsync(AppConfig config, CancellationToken ct)
     {
-        using var certificate = ConfigWizard.LoadCertificate(config);
+        var certificate = ConfigWizard.LoadCertificate(config);
         foreach (var node in config.Nodes)
         {
             using var store = ConfigWizard.BuildStore(node.Url, config.DatabaseName, certificate);

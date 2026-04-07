@@ -4,6 +4,22 @@ namespace ConsistencyCheck;
 
 internal static class ChangeVectorSemantics
 {
+    public static ChangeVectorSemanticsSnapshot CloneSnapshot(ChangeVectorSemanticsSnapshot snapshot)
+    {
+        return new ChangeVectorSemanticsSnapshot
+        {
+            Nodes = snapshot.Nodes.Select(node => new ChangeVectorSemanticsNodeInfo
+            {
+                NodeUrl = node.NodeUrl,
+                Label = node.Label,
+                DatabaseId = node.DatabaseId,
+                DatabaseChangeVector = node.DatabaseChangeVector
+            }).ToList(),
+            ExplicitUnusedDatabaseIds = snapshot.ExplicitUnusedDatabaseIds.ToList(),
+            PotentialUnusedDatabaseIds = snapshot.PotentialUnusedDatabaseIds.ToList()
+        };
+    }
+
     public static ChangeVectorSemanticsSnapshot CreateSnapshot(
         IEnumerable<ChangeVectorSemanticsNodeInfo> nodes,
         IEnumerable<string>? explicitUnusedDatabaseIds)

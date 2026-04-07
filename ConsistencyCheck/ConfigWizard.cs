@@ -26,7 +26,7 @@ public sealed class ConfigWizard
         AnsiConsole.MarkupLine("[grey]Press CTRL+C at any time to abort.[/]");
         AnsiConsole.WriteLine();
 
-        PrintStep(1, 9, "Database name");
+        PrintStep(1, 8, "Database name");
         var databaseName = await new TextPrompt<string>("  RavenDB [cyan]database name[/]:")
             .Validate(value => string.IsNullOrWhiteSpace(value)
                 ? ValidationResult.Error("[red]Database name cannot be empty.[/]")
@@ -34,7 +34,7 @@ public sealed class ConfigWizard
             .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
 
         AnsiConsole.WriteLine();
-        PrintStep(2, 9, "Number of cluster nodes");
+        PrintStep(2, 8, "Number of cluster nodes");
         var nodeCount = await new SelectionPrompt<int>()
             .Title("  How many [cyan]nodes[/] does the cluster have?")
             .AddChoices(2, 3, 4, 5)
@@ -42,7 +42,7 @@ public sealed class ConfigWizard
             .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
 
         AnsiConsole.WriteLine();
-        PrintStep(3, 9, "Node URLs and labels");
+        PrintStep(3, 8, "Node URLs and labels");
         var nodes = new List<NodeConfig>();
         for (var i = 0; i < nodeCount; i++)
         {
@@ -73,27 +73,26 @@ public sealed class ConfigWizard
         }
 
         AnsiConsole.WriteLine();
-        PrintStep(4, 9, "Client certificate");
+        PrintStep(4, 8, "Client certificate");
         var (certPath, certPassword) = AskForCertificate(ct);
 
         AnsiConsole.WriteLine();
-        PrintStep(5, 9, "TLS validation");
+        PrintStep(5, 8, "TLS validation");
         var allowInvalidServerCertificates = await AskForServerCertificateValidationAsync(nodes, ct).ConfigureAwait(false);
 
         AnsiConsole.WriteLine();
-        PrintStep(6, 9, "Run mode");
+        PrintStep(6, 8, "Run mode");
         var (runMode, scanMode) = await AskForRunModeAsync(ct).ConfigureAwait(false);
+        var applyExecutionMode = runMode == RunMode.ApplyRepairPlan
+            ? await AskForApplyExecutionModeAsync(ct).ConfigureAwait(false)
+            : ApplyExecutionMode.InteractivePerDocument;
 
         AnsiConsole.WriteLine();
-        PrintStep(7, 9, "Starting position");
-        var startEtag = await AskForStartEtagAsync(ct).ConfigureAwait(false);
-
-        AnsiConsole.WriteLine();
-        PrintStep(8, 9, "Throttling");
+        PrintStep(7, 8, "Throttling");
         var throttle = await AskForThrottleAsync(ct).ConfigureAwait(false);
 
         AnsiConsole.WriteLine();
-        PrintStep(9, 9, "Local state storage");
+        PrintStep(8, 8, "Local state storage");
         var stateStore = await AskForStateStoreAsync(ct).ConfigureAwait(false);
 
         var config = new AppConfig
@@ -105,8 +104,9 @@ public sealed class ConfigWizard
             CertificatePassword = certPassword,
             AllowInvalidServerCertificates = allowInvalidServerCertificates,
             RunMode = runMode,
+            ApplyExecutionMode = applyExecutionMode,
             Mode = scanMode,
-            StartEtag = startEtag,
+            StartEtag = null,
             Throttle = throttle,
             StateStore = stateStore
         };
@@ -145,8 +145,7 @@ public sealed class ConfigWizard
            && !NeedsTlsValidationPrompt(config)
            && !NeedsRunModePrompt(config)
            && !NeedsThrottlePrompt(config)
-           && !NeedsStateStorePrompt(config)
-           && !NeedsStartEtagPrompt(config);
+           && !NeedsStateStorePrompt(config);
 
     public async Task<AppConfig> CompleteConfigAsync(AppConfig config, CancellationToken ct)
     {
@@ -191,17 +190,11 @@ public sealed class ConfigWizard
             var (runMode, scanMode) = await AskForRunModeAsync(ct).ConfigureAwait(false);
             config.RunMode = runMode;
             config.Mode = scanMode;
+            config.ApplyExecutionMode = runMode == RunMode.ApplyRepairPlan
+                ? await AskForApplyExecutionModeAsync(ct).ConfigureAwait(false)
+                : ApplyExecutionMode.InteractivePerDocument;
             config.MissingProperties.Remove(nameof(AppConfig.RunMode));
             config.MissingProperties.Remove(nameof(AppConfig.Mode));
-        }
-
-        if (NeedsStartEtagPrompt(config))
-        {
-            AnsiConsole.WriteLine();
-            AnsiConsole.MarkupLine("[bold cyan]Starting position[/] — [bold]Start ETag[/]");
-            AnsiConsole.WriteLine();
-            config.StartEtag = await AskForStartEtagAsync(ct).ConfigureAwait(false);
-            config.MissingProperties.Remove(nameof(AppConfig.StartEtag));
         }
 
         if (NeedsThrottlePrompt(config))
@@ -251,28 +244,70 @@ public sealed class ConfigWizard
         return config;
     }
 
+    public async Task<AppConfig> ChooseRunModeForLaunchAsync(AppConfig config, CancellationToken ct)
+    {
+        config.Throttle ??= new ThrottleConfig();
+        config.StateStore ??= new StateStoreConfig();
+
+        AnsiConsole.MarkupLine("[bold yellow]Launch Mode[/]");
+        AnsiConsole.MarkupLine("[grey]Choose how this run should behave. This selection applies only to the current launch.[/]");
+        AnsiConsole.WriteLine();
+
+        DisplayConfigSummary(config);
+        AnsiConsole.WriteLine();
+
+        var (runMode, scanMode) = await AskForRunModeAsync(ct).ConfigureAwait(false);
+        config.RunMode = runMode;
+        config.Mode = scanMode;
+        config.ApplyExecutionMode = runMode == RunMode.ApplyRepairPlan
+            ? await AskForApplyExecutionModeAsync(ct).ConfigureAwait(false)
+            : ApplyExecutionMode.InteractivePerDocument;
+
+        AnsiConsole.WriteLine();
+        AnsiConsole.MarkupLine("[bold]This launch will use:[/]");
+        DisplayConfigSummary(config);
+        AnsiConsole.WriteLine();
+
+        return config;
+    }
+
     private static async Task<(RunMode RunMode, CheckMode CheckMode)> AskForRunModeAsync(CancellationToken ct)
     {
+        const string importSnapshotsOption =
+            "Import snapshots only  [grey]- stream all configured nodes directly into the local RavenDB snapshot set[/]";
         const string scanOnlyOption =
-            "Scan only  [grey]— detect inconsistencies without modifying the cluster[/]";
+            "Report mismatches from imported snapshots  [grey]- wait for the local index and persist findings only[/]";
         const string dryRunRepairOption =
-            "Dry-run repair  [grey]— plan exact repair actions without changing the cluster[/]";
+            "Collect repair plan from imported snapshots  [grey]- analyze imported snapshots and persist exact repair actions[/]";
+        const string applyRepairPlanOption =
+            "Apply saved repair plan  [grey]- execute a previously collected plan without rescanning[/]";
         const string scanAndRepairOption =
-            "Scan and repair  [grey]— detect inconsistencies and touch the winner copy[/]";
+            "Analyze imported snapshots and repair  [grey]- analyze imported snapshots and touch the winner copy[/]";
+        const string liveETagScanOption =
+            "Live ETag scan  [grey]- stream IDs from one node by ETag, fetch live metadata, build repair plan directly[/]";
+        const string snapshotCrossCheckOption =
+            "[[TEMP]] Snapshot cross-check  [grey]- enumerate all imported snapshots, fetch live metadata, build repair plan (bypasses index)[/]";
+        const string mismatchDecisionFixupOption =
+            "[[TEMP2]] Fix mismatch decisions  [grey]- restore SkippedAlreadyPlanned mismatches to PatchPlannedDryRun in a SnapshotCrossCheck run[/]";
 
         var runModeChoice = await new SelectionPrompt<string>()
             .Title("  Select [cyan]run mode[/]:")
-            .AddChoices(scanOnlyOption, dryRunRepairOption, scanAndRepairOption)
+            .AddChoices(importSnapshotsOption, scanOnlyOption, dryRunRepairOption, applyRepairPlanOption, scanAndRepairOption, liveETagScanOption, snapshotCrossCheckOption, mismatchDecisionFixupOption)
             .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
 
         var runMode = runModeChoice switch
         {
+            importSnapshotsOption => RunMode.ImportSnapshots,
             dryRunRepairOption => RunMode.DryRunRepair,
+            applyRepairPlanOption => RunMode.ApplyRepairPlan,
             scanAndRepairOption => RunMode.ScanAndRepair,
+            liveETagScanOption => RunMode.LiveETagScan,
+            snapshotCrossCheckOption => RunMode.SnapshotCrossCheck,
+            mismatchDecisionFixupOption => RunMode.MismatchDecisionFixup,
             _ => RunMode.ScanOnly
         };
 
-        if (runMode is RunMode.ScanAndRepair or RunMode.DryRunRepair)
+        if (runMode is RunMode.ImportSnapshots or RunMode.ScanAndRepair or RunMode.DryRunRepair or RunMode.ApplyRepairPlan or RunMode.LiveETagScan or RunMode.SnapshotCrossCheck or RunMode.MismatchDecisionFixup)
             return (runMode, CheckMode.AllMismatches);
 
         const string firstMismatch =
@@ -290,26 +325,53 @@ public sealed class ConfigWizard
             scanModeChoice == firstMismatch ? CheckMode.FirstMismatch : CheckMode.AllMismatches);
     }
 
-    private static async Task<long> AskForStartEtagAsync(CancellationToken ct)
+    private static async Task<ApplyExecutionMode> AskForApplyExecutionModeAsync(CancellationToken ct)
     {
-        const string fromBeginning =
-            "Scan from the beginning  [grey]— ETag 0[/]";
-        const string fromSpecific =
-            "Start from a specific ETag  [grey]— skip older documents[/]";
+        const string interactiveOption =
+            "Interactive per document  [grey]- live-check every document, show node CVs, and wait for confirmation[/]";
+        const string automaticOption =
+            "Automatic  [grey]- still live-check every document, but continue without per-document prompts[/]";
 
         var choice = await new SelectionPrompt<string>()
-            .Title("  Select [cyan]starting position[/]:")
-            .AddChoices(fromBeginning, fromSpecific)
+            .Title("  Select [cyan]apply execution mode[/]:")
+            .AddChoices(interactiveOption, automaticOption)
+            .ShowAsync(AnsiConsole.Console, ct)
+            .ConfigureAwait(false);
+
+        return choice == automaticOption
+            ? ApplyExecutionMode.Automatic
+            : ApplyExecutionMode.InteractivePerDocument;
+    }
+
+    internal static async Task<(int SourceNodeIndex, long? StartEtag)> AskForLiveETagScanOptionsAsync(
+        List<NodeConfig> nodes,
+        CancellationToken ct)
+    {
+        AnsiConsole.WriteLine();
+        AnsiConsole.MarkupLine("  [grey]Live ETag scan options[/]");
+
+        var indexedNodes = nodes.Select((node, i) => (Index: i, Node: node)).ToList();
+        var chosen = await new SelectionPrompt<(int Index, NodeConfig Node)>()
+            .Title("  Select [cyan]source node[/] (document IDs will be iterated from this node by ETag):")
+            .UseConverter(c => $"{c.Node.Label}  [grey]({c.Node.Url})[/]")
+            .AddChoices(indexedNodes)
             .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
 
-        if (choice == fromBeginning)
-            return 0;
+        var sourceNodeIndex = chosen.Index;
 
-        return await new TextPrompt<long>("  Enter the [cyan]starting ETag[/]:")
-            .Validate(value => value >= 0
-                ? ValidationResult.Success()
-                : ValidationResult.Error("[red]ETag must be >= 0.[/]"))
+        var startEtagText = await new TextPrompt<string>("  Start [cyan]ETag[/] [grey](0 = from the beginning, or paste the ETag to continue from)[/]:")
+            .DefaultValue("0")
+            .Validate(value =>
+            {
+                if (!long.TryParse(value, out var etag) || etag < 0)
+                    return ValidationResult.Error("[red]ETag must be a non-negative integer.[/]");
+                return ValidationResult.Success();
+            })
             .ShowAsync(AnsiConsole.Console, ct).ConfigureAwait(false);
+
+        long.TryParse(startEtagText, out var startEtag);
+
+        return (sourceNodeIndex, startEtag == 0 ? null : startEtag);
     }
 
     private static async Task<ThrottleConfig> AskForThrottleAsync(CancellationToken ct)
@@ -479,7 +541,7 @@ public sealed class ConfigWizard
     private static async Task<bool> TestConnectivityAsync(AppConfig config, CancellationToken ct)
     {
         var results = new bool[config.Nodes.Count];
-        using var certificate = LoadCertificate(config);
+        var certificate = LoadCertificate(config);
         using var certificateValidationScope = RavenCertificateValidationScope.Create(
             config.Nodes.Select(node => node.Url),
             config.AllowInvalidServerCertificates);
@@ -640,9 +702,6 @@ public sealed class ConfigWizard
     private static bool NeedsStateStorePrompt(AppConfig config)
         => config.MissingProperties.Contains(nameof(AppConfig.StateStore));
 
-    private static bool NeedsStartEtagPrompt(AppConfig config)
-        => !config.StartEtag.HasValue || config.MissingProperties.Contains(nameof(AppConfig.StartEtag));
-
     private static void PrintStep(int step, int total, string title) =>
         AnsiConsole.MarkupLine($"[bold cyan]Step {step}/{total}[/] — [bold]{title}[/]");
 
@@ -660,9 +719,16 @@ public sealed class ConfigWizard
                 ? "[yellow]not specified[/]"
                 : config.RunMode switch
                 {
-                    RunMode.ScanOnly => "[cyan]Scan only[/]",
-                    RunMode.DryRunRepair => "[cyan]Dry-run repair[/]",
-                    RunMode.ScanAndRepair => "[cyan]Scan and repair[/]",
+                    RunMode.ImportSnapshots => "[cyan]Import snapshots only[/]",
+                    RunMode.DownloadSnapshotsToCache => "[cyan]Download snapshots to local cache[/]",
+                    RunMode.ImportCachedSnapshotsToStateStore => "[cyan]Import cached snapshots into local RavenDB[/]",
+                    RunMode.ScanOnly => "[cyan]Report mismatches from imported snapshots[/]",
+                    RunMode.DryRunRepair => "[cyan]Collect repair plan from imported snapshots[/]",
+                    RunMode.ApplyRepairPlan => "[cyan]Apply saved repair plan[/]",
+                    RunMode.ScanAndRepair => "[cyan]Analyze imported snapshots and repair[/]",
+                    RunMode.LiveETagScan => "[cyan]Live ETag scan — build repair plan directly[/]",
+                    RunMode.SnapshotCrossCheck => "[cyan][[TEMP]] Snapshot cross-check — fetch live metadata for all snapshots[/]",
+                    RunMode.MismatchDecisionFixup => "[cyan][[TEMP2]] Fix mismatch decisions — restore SkippedAlreadyPlanned to PatchPlannedDryRun[/]",
                     _ => $"[cyan]{config.RunMode}[/]"
                 });
         table.AddRow(
@@ -671,19 +737,27 @@ public sealed class ConfigWizard
                 ? "[yellow]not specified[/]"
                 : config.RunMode switch
                 {
-                    RunMode.ScanAndRepair => "[grey]Full traversal (repair mode)[/]",
-                    RunMode.DryRunRepair => "[grey]Full traversal (dry-run repair mode)[/]",
-                    _ => $"[cyan]{config.Mode}[/]"
+                    RunMode.ImportSnapshots => "[grey]Not applicable (direct import stage only)[/]",
+                    RunMode.DownloadSnapshotsToCache => "[grey]Not applicable (download stage only)[/]",
+                    RunMode.ImportCachedSnapshotsToStateStore => "[grey]Not applicable (import stage only)[/]",
+                    RunMode.ScanAndRepair => "[grey]Analyze imported snapshots and repair[/]",
+                    RunMode.DryRunRepair => "[grey]Analyze imported snapshots and collect repair plan[/]",
+                    RunMode.ApplyRepairPlan => "[grey]Saved plan execution (no re-scan)[/]",
+                    RunMode.LiveETagScan => "[grey]Live scan (no imported snapshots needed)[/]",
+                    RunMode.SnapshotCrossCheck => "[grey][[TEMP]] Cross-check snapshots with live cluster metadata[/]",
+                    RunMode.MismatchDecisionFixup => "[grey][[TEMP2]] Offline fixup only (no cluster access)[/]",
+                    _ => config.Mode == CheckMode.FirstMismatch
+                        ? "[cyan]First mismatch[/]"
+                        : "[cyan]All mismatches[/]"
                 });
-        table.AddRow(
-            "Start ETag",
-            NeedsStartEtagPrompt(config)
-                ? "[yellow]not specified[/]"
-                : config.StartEtag.GetValueOrDefault() switch
-            {
-                0 => "[grey]0 (scan from the beginning)[/]",
-                var startEtag => $"[cyan]{startEtag:N0}[/]"
-            });
+        if (config.RunMode == RunMode.ApplyRepairPlan)
+        {
+            table.AddRow(
+                "Apply mode",
+                config.ApplyExecutionMode == ApplyExecutionMode.Automatic
+                    ? "[yellow]Automatic[/]"
+                    : "[green]Interactive per document[/]");
+        }
 
         for (var i = 0; i < config.Nodes.Count; i++)
         {

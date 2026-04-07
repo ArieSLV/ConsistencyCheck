@@ -283,9 +283,6 @@ public sealed class ProgressStore
         if (!rootProperties.Contains(nameof(AppConfig.Mode)))
             missing.Add(nameof(AppConfig.Mode));
 
-        if (!rootProperties.Contains(nameof(AppConfig.StartEtag)))
-            missing.Add(nameof(AppConfig.StartEtag));
-
         if (!rootProperties.Contains(nameof(AppConfig.AllowInvalidServerCertificates)))
             missing.Add(nameof(AppConfig.AllowInvalidServerCertificates));
 

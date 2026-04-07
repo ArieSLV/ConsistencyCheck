@@ -275,7 +275,7 @@ public sealed class ConsistencyChecker : IAsyncDisposable
 
         var mismatches = new List<MismatchDocument>();
         var repairs = new List<RepairDocument>();
-        var repairGuards = new List<RepairGuardDocument>();
+        var repairGuards = new List<RepairActionGuardDocument>();
         var diagnostics = new List<DiagnosticDocument>();
 
         long mismatchCount = 0;
@@ -349,7 +349,7 @@ public sealed class ConsistencyChecker : IAsyncDisposable
 
         var mismatches = new List<MismatchDocument>();
         var repairs = new List<RepairDocument>();
-        var repairGuards = new List<RepairGuardDocument>();
+        var repairGuards = new List<RepairActionGuardDocument>();
         var diagnostics = new List<DiagnosticDocument>();
         var repairCandidates = new List<RepairCandidate>();
         var supportsRepairPlanning = run.RunMode is RunMode.ScanAndRepair or RunMode.DryRunRepair;
@@ -365,7 +365,6 @@ public sealed class ConsistencyChecker : IAsyncDisposable
             if (string.Equals(evaluation.MismatchType, "AMBIGUOUS_CV", StringComparison.Ordinal))
             {
                 evaluation.RepairDecision = "SkippedAmbiguousCv";
-                repairs.Add(CreateRepairDecision(run, evaluation, "SkippedAmbiguousCv", error: null));
                 continue;
             }
 
@@ -374,7 +373,6 @@ public sealed class ConsistencyChecker : IAsyncDisposable
                 string.IsNullOrWhiteSpace(evaluation.WinnerNode))
             {
                 evaluation.RepairDecision = "SkippedCollectionMismatch";
-                repairs.Add(CreateRepairDecision(run, evaluation, "SkippedCollectionMismatch", error: null));
                 continue;
             }
 
@@ -393,7 +391,7 @@ public sealed class ConsistencyChecker : IAsyncDisposable
 
         if (supportsRepairPlanning && repairCandidates.Count > 0)
         {
-            var guardedIds = await _stateStore.GetPatchedDocumentIdsAsync(
+            var guardedIds = await _stateStore.GetGuardedDocumentIdsAsync(
                     run.RunId,
                     repairCandidates.Select(candidate => candidate.DocumentId).ToArray(),
                     ct)
@@ -402,13 +400,8 @@ public sealed class ConsistencyChecker : IAsyncDisposable
             var candidatesToExecute = new List<RepairCandidate>();
             foreach (var candidate in repairCandidates)
             {
-                var evaluation = evaluations.First(e =>
-                    string.Equals(e.DocumentId, candidate.DocumentId, StringComparison.OrdinalIgnoreCase));
-
                 if (guardedIds.Contains(candidate.DocumentId))
                 {
-                    evaluation.RepairDecision = "SkippedAlreadyPatchedThisRun";
-                    repairs.Add(CreateRepairDecision(run, evaluation, "SkippedAlreadyPatchedThisRun", error: null));
                     continue;
                 }
 
@@ -433,7 +426,7 @@ public sealed class ConsistencyChecker : IAsyncDisposable
         {
             mismatches.Add(new MismatchDocument
             {
-                Id = StateStore.CreateMismatchId(run.RunId),
+                Id = StateStore.GetMismatchId(run.RunId, evaluation.DocumentId),
                 RunId = run.RunId,
                 DocumentId = evaluation.DocumentId,
                 Collection = evaluation.Collection,
@@ -444,6 +437,7 @@ public sealed class ConsistencyChecker : IAsyncDisposable
                     .Select(CloneObservedState)
                     .ToList(),
                 RepairDecision = evaluation.RepairDecision,
+                CurrentRepairDecision = evaluation.RepairDecision,
                 DetectedAt = DateTimeOffset.UtcNow
             });
         }
@@ -492,7 +486,7 @@ public sealed class ConsistencyChecker : IAsyncDisposable
             .OrderBy(node => node, StringComparer.OrdinalIgnoreCase)
             .ToList();
 
-        var query = $"from \"{EscapeRqlString(first.Collection)}\" where id() in ($ids) update {{ put(id(this), this); }}";
+        var query = RepairPatchQueryBuilder.BuildTouchWinnerPatchQuery(first.Collection);
         var indexQuery = new IndexQuery
         {
             Query = query,
@@ -513,22 +507,21 @@ public sealed class ConsistencyChecker : IAsyncDisposable
                 WinnerNode = first.WinnerNode,
                 WinnerCV = first.WinnerCV,
                 AffectedNodes = affectedNodes,
-                PatchQuery = query,
                 PatchOperationId = null,
                 RepairStatus = "PatchPlannedDryRun",
                 CompletedAt = DateTimeOffset.UtcNow
             };
 
             var dryRunGuards = documentIds
-                .Select(documentId => new RepairGuardDocument
+                .Select(documentId => new RepairActionGuardDocument
                 {
-                    Id = StateStore.GetRepairGuardId(run.RunId, documentId),
+                    Id = StateStore.GetRepairActionGuardId(run.RunId, documentId),
                     RunId = run.RunId,
                     DocumentId = documentId,
                     WinnerNode = first.WinnerNode,
                     WinnerCV = first.WinnerCV,
                     PatchOperationId = null,
-                    PatchedAt = DateTimeOffset.UtcNow
+                    RecordedAt = DateTimeOffset.UtcNow
                 })
                 .ToList();
 
@@ -557,20 +550,19 @@ public sealed class ConsistencyChecker : IAsyncDisposable
             WinnerNode = first.WinnerNode,
             WinnerCV = first.WinnerCV,
             AffectedNodes = affectedNodes,
-            PatchQuery = query,
             RepairStatus = "PatchFailed",
             CompletedAt = DateTimeOffset.UtcNow
         };
 
         var guards = documentIds
-            .Select(documentId => new RepairGuardDocument
+            .Select(documentId => new RepairActionGuardDocument
             {
-                Id = StateStore.GetRepairGuardId(run.RunId, documentId),
+                Id = StateStore.GetRepairActionGuardId(run.RunId, documentId),
                 RunId = run.RunId,
                 DocumentId = documentId,
                 WinnerNode = first.WinnerNode,
                 WinnerCV = first.WinnerCV,
-                PatchedAt = DateTimeOffset.UtcNow
+                RecordedAt = DateTimeOffset.UtcNow
             })
             .ToList();
 
@@ -696,7 +688,6 @@ public sealed class ConsistencyChecker : IAsyncDisposable
             WinnerNode = evaluation.WinnerNode ?? string.Empty,
             WinnerCV = evaluation.WinnerCV,
             AffectedNodes = evaluation.AffectedNodes.ToList(),
-            PatchQuery = string.Empty,
             RepairStatus = status,
             CompletedAt = DateTimeOffset.UtcNow,
             Error = error
@@ -963,8 +954,6 @@ public sealed class ConsistencyChecker : IAsyncDisposable
         return false;
     }
 
-    private static string EscapeRqlString(string value) => value.Replace("\"", "\"\"");
-
     private static HttpClient BuildHttpClient(
         X509Certificate2? certificate,
         bool allowInvalidServerCertificates,
@@ -1049,13 +1038,13 @@ public sealed class ConsistencyChecker : IAsyncDisposable
         List<VersionKey> ProcessedVersionKeys,
         List<MismatchDocument> Mismatches,
         List<RepairDocument> Repairs,
-        List<RepairGuardDocument> RepairGuards,
+        List<RepairActionGuardDocument> RepairGuards,
         List<DiagnosticDocument> Diagnostics);
 
     private sealed record LookupOutcome(
         List<MismatchDocument> Mismatches,
         List<RepairDocument> Repairs,
-        List<RepairGuardDocument> RepairGuards,
+        List<RepairActionGuardDocument> RepairGuards,
         List<DiagnosticDocument> Diagnostics,
         long MismatchesFound,
         long RepairsPlanned,
@@ -1065,7 +1054,7 @@ public sealed class ConsistencyChecker : IAsyncDisposable
 
     private sealed record RepairGroupOutcome(
         RepairDocument RepairDocument,
-        List<RepairGuardDocument> RepairGuards,
+        List<RepairActionGuardDocument> RepairGuards,
         long RepairsPlanned,
         long RepairsAttempted,
         long RepairsPatchedOnWinner,

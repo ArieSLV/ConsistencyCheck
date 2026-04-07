@@ -30,21 +30,102 @@ public enum CheckMode
 public enum RunMode
 {
     /// <summary>
-    /// Detect inconsistencies and persist the findings, but do not modify the cluster.
+    /// Legacy direct-import mode kept only for backward compatibility with older
+    /// persisted configs and runs. New launches should use
+    /// <see cref="DownloadSnapshotsToCache"/> and
+    /// <see cref="ImportCachedSnapshotsToStateStore"/> instead.
+    /// </summary>
+    ImportSnapshots,
+
+    /// <summary>
+    /// Download metadata-only snapshots from one selected customer node into the local
+    /// segmented file cache without touching the local RavenDB snapshot collection.
+    /// </summary>
+    DownloadSnapshotsToCache,
+
+    /// <summary>
+    /// Import one selected cached node snapshot stream from the local file cache into the
+    /// local RavenDB state store.
+    /// </summary>
+    ImportCachedSnapshotsToStateStore,
+
+    /// <summary>
+    /// Analyze an already imported snapshot set and persist detected inconsistencies
+    /// without modifying the customer cluster.
     /// </summary>
     ScanOnly,
 
     /// <summary>
-    /// Detect inconsistencies and build the exact repair plan that would be executed,
-    /// but never send patch operations to the customer cluster.
+    /// Analyze an already imported snapshot set and build the exact repair plan that
+    /// would be executed, but never send patch operations to the customer cluster.
     /// </summary>
     DryRunRepair,
 
     /// <summary>
-    /// Detect inconsistencies and immediately try to repair resolvable documents by
-    /// touching the winner copy so replication re-fans the document out.
+    /// Execute a previously collected repair plan without re-scanning the cluster.
+    /// The plan must already exist in the local state store.
     /// </summary>
-    ScanAndRepair
+    ApplyRepairPlan,
+
+    /// <summary>
+    /// Analyze an already imported snapshot set and immediately try to repair
+    /// resolvable documents by touching the winner copy so replication re-fans
+    /// the document out.
+    /// </summary>
+    ScanAndRepair,
+
+    /// <summary>
+    /// Stream document IDs from one node in ETag order, fetch metadata live from all
+    /// nodes, and build a repair plan directly — without importing snapshots first.
+    /// Useful for catching new inconsistencies that appeared after the last snapshot run.
+    /// </summary>
+    LiveETagScan,
+
+    /// <summary>
+    /// [TEMPORARY] Enumerate all already-imported snapshots node by node (A→B→C),
+    /// fetch live metadata from the cluster for each document, and build a repair plan.
+    /// Skips documents that were successfully repaired in any previous run.
+    /// Bypasses the <c>NodeDocumentSnapshots/ProblemDocuments</c> index entirely.
+    /// </summary>
+    SnapshotCrossCheck,
+
+    /// <summary>
+    /// [TEMPORARY] Fix MismatchDocuments where RepairDecision was incorrectly set to
+    /// "SkippedAlreadyPlanned" due to duplicate cross-node encounters in a SnapshotCrossCheck run.
+    /// Restores affected documents to "PatchPlannedDryRun" so they appear in the repair plan.
+    /// </summary>
+    MismatchDecisionFixup
+}
+
+/// <summary>
+/// Controls how a saved repair plan is executed.
+/// </summary>
+public enum ApplyExecutionMode
+{
+    /// <summary>
+    /// Show one document at a time, wait for operator confirmation, and only switch to
+    /// automatic execution when explicitly requested.
+    /// </summary>
+    InteractivePerDocument,
+
+    /// <summary>
+    /// Apply the saved plan without per-document confirmation prompts.
+    /// </summary>
+    Automatic
+}
+
+/// <summary>
+/// Tracks the current execution phase of a scan-style run so interrupted imports
+/// can be resumed deterministically.
+/// </summary>
+public enum ScanExecutionPhase
+{
+    None,
+    SnapshotCacheDownload,
+    SnapshotImport,
+    WaitingForSnapshotIndex,
+    CandidateProcessing,
+    Completed
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -204,13 +285,23 @@ public sealed class AppConfig
     public CheckMode Mode { get; set; } = CheckMode.AllMismatches;
 
     /// <summary>
-    /// Top-level application mode. <see cref="RunMode.ScanOnly"/> only reports
-    /// inconsistencies, <see cref="RunMode.DryRunRepair"/> records what would be repaired
-    /// without mutating the cluster, and <see cref="RunMode.ScanAndRepair"/> performs
-    /// winner-side patch-by-query operations.
+    /// Top-level application mode. <see cref="RunMode.DownloadSnapshotsToCache"/>
+    /// downloads metadata snapshots into the local segmented file cache;
+    /// <see cref="RunMode.ImportCachedSnapshotsToStateStore"/> imports one cached node
+    /// into the local RavenDB snapshot collection; <see cref="RunMode.ScanOnly"/>,
+    /// <see cref="RunMode.DryRunRepair"/> and <see cref="RunMode.ScanAndRepair"/>
+    /// analyze an already imported snapshot set; <see cref="RunMode.ApplyRepairPlan"/>
+    /// executes a previously collected repair plan.
     /// </summary>
     [JsonConverter(typeof(JsonStringEnumConverter))]
     public RunMode RunMode { get; set; } = RunMode.ScanOnly;
+
+    /// <summary>
+    /// Controls whether <see cref="RunMode.ApplyRepairPlan"/> runs interactively one
+    /// document at a time or continues automatically.
+    /// </summary>
+    [JsonConverter(typeof(JsonStringEnumConverter))]
+    public ApplyExecutionMode ApplyExecutionMode { get; set; } = ApplyExecutionMode.InteractivePerDocument;
 
     /// <summary>Throttling parameters. See <see cref="ThrottleConfig"/> for details.</summary>
     public ThrottleConfig Throttle { get; set; } = new();
@@ -227,21 +318,21 @@ public sealed class AppConfig
     public bool AllowInvalidServerCertificates { get; set; }
 
     /// <summary>
-    /// ETag value from which to begin scanning when starting a fresh run.
+    /// Legacy field kept for backward compatibility with older config files.
+    /// The current snapshot-index pipeline does not use it.
     /// </summary>
-    /// <remarks>
-    /// Three distinct states:
-    /// <list type="bullet">
-    ///   <item><description><c>null</c> — not yet specified; the setup/completion wizard will ask for it.</description></item>
-    ///   <item><description><c>0</c> — scan from the very beginning.</description></item>
-    ///   <item><description>Any positive value — skip older documents and start from that ETag.</description></item>
-    /// </list>
-    /// </remarks>
     public long? StartEtag { get; set; } = null;
 
     /// <summary>Returns the <see cref="NodeConfig"/> designated as the source node.</summary>
     [JsonIgnore]
     public NodeConfig SourceNode => Nodes[SourceNodeIndex];
+
+    /// <summary>
+    /// Ephemeral launch-only selection for snapshot cache download / cached snapshot
+    /// import modes: when set, only this node is processed during the current launch.
+    /// </summary>
+    [JsonIgnore]
+    public string? SelectedImportNodeUrl { get; set; }
 
     /// <summary>
     /// Returns all nodes that are comparison targets (i.e., every node except the source).
@@ -377,6 +468,14 @@ public sealed class RunHeadDocument
     public string? LatestRunId { get; set; }
     public string? LastCompletedRunId { get; set; }
     public long? LastCompletedSafeRestartEtag { get; set; }
+    public string? ActiveSnapshotCacheRunId { get; set; }
+    public DateTimeOffset? ActiveSnapshotCacheCompletedAt { get; set; }
+    public string? PendingSnapshotCacheRunId { get; set; }
+    public DateTimeOffset? PendingSnapshotCacheStartedAt { get; set; }
+    public string? ActiveSnapshotRunId { get; set; }
+    public DateTimeOffset? ActiveSnapshotCompletedAt { get; set; }
+    public string? PendingSnapshotRunId { get; set; }
+    public DateTimeOffset? PendingSnapshotStartedAt { get; set; }
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
 }
 
@@ -397,17 +496,75 @@ public sealed class RunStateDocument
     public DateTimeOffset LastSavedAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset? CompletedAt { get; set; }
     public bool IsComplete { get; set; }
+    [JsonConverter(typeof(JsonStringEnumConverter))]
+    public ScanExecutionPhase CurrentPhase { get; set; }
+    public List<SnapshotCacheNodeState> SnapshotCacheNodes { get; set; } = [];
+    public bool SnapshotImportCompleted { get; set; }
+    public List<SnapshotImportNodeState> SnapshotImportNodes { get; set; } = [];
     public List<NodeCursorState> NodeCursors { get; set; } = [];
+    public long SnapshotDocumentsImported { get; set; }
+    public long SnapshotDocumentsSkipped { get; set; }
+    public long SnapshotBulkInsertRestarts { get; set; }
+    public long CandidateDocumentsFound { get; set; }
+    public long CandidateDocumentsProcessed { get; set; }
+    public long CandidateDocumentsExcludedBySkippedSnapshots { get; set; }
     public long DocumentsInspected { get; set; }
     public long UniqueVersionsCompared { get; set; }
     public long MismatchesFound { get; set; }
+    public long ManualReviewDocumentsFound { get; set; }
     public long RepairsPlanned { get; set; }
     public long RepairsAttempted { get; set; }
     public long RepairsPatchedOnWinner { get; set; }
     public long RepairsFailed { get; set; }
     public long? SafeRestartEtag { get; set; }
+    public string? SourceRepairPlanRunId { get; set; }
+    public string? SourceSnapshotCacheRunId { get; set; }
+    public string? SourceSnapshotRunId { get; set; }
     public ChangeVectorSemanticsSnapshot? ChangeVectorSemanticsSnapshot { get; set; }
     public AppConfig? ConfigSnapshot { get; set; }
+}
+
+/// <summary>
+/// Durable per-node snapshot cache download progress.
+/// </summary>
+public sealed class SnapshotCacheNodeState
+{
+    public string NodeUrl { get; set; } = string.Empty;
+    public string NodeLabel { get; set; } = string.Empty;
+    public string NodeAlias { get; set; } = string.Empty;
+    public bool IsDownloadComplete { get; set; }
+    public DateTimeOffset? DownloadCompletedAt { get; set; }
+    public string? LastDownloadedDocumentId { get; set; }
+    public long DownloadedRows { get; set; }
+    public int CompletedSegmentCount { get; set; }
+    public long CompressedBytesWritten { get; set; }
+    public int CurrentSegmentId { get; set; } = 1;
+    public long CurrentSegmentCommittedBytes { get; set; }
+    public long CurrentSegmentCommittedRows { get; set; }
+    public DateTimeOffset? LastUpdatedAt { get; set; }
+}
+
+/// <summary>
+/// Durable per-node cached snapshot import progress, including resilient local bulk-insert
+/// restarts and the exact local cache cursor.
+/// </summary>
+public sealed class SnapshotImportNodeState
+{
+    public string NodeUrl { get; set; } = string.Empty;
+    public string NodeLabel { get; set; } = string.Empty;
+    public bool IsImportComplete { get; set; }
+    public DateTimeOffset? ImportCompletedAt { get; set; }
+    public int CurrentSegmentId { get; set; } = 1;
+    public int CurrentPageNumber { get; set; } = 1;
+    public int CurrentRowOffsetInPage { get; set; }
+    public long ImportedRows { get; set; }
+    public long SnapshotsCommitted { get; set; }
+    public long SnapshotsSkipped { get; set; }
+    public long BulkInsertRestartCount { get; set; }
+    public string? LastConfirmedSnapshotId { get; set; }
+    public string? LastSkippedSnapshotId { get; set; }
+    public string? LastError { get; set; }
+    public DateTimeOffset? LastUpdatedAt { get; set; }
 }
 
 /// <summary>
@@ -466,6 +623,9 @@ public sealed class MismatchDocument
     public string? WinnerCV { get; set; }
     public List<NodeObservedState> ObservedState { get; set; } = [];
     public string RepairDecision { get; set; } = string.Empty;
+    public string? CurrentRepairDecision { get; set; }
+    public string? LastRepairRunId { get; set; }
+    public DateTimeOffset? LastRepairUpdatedAt { get; set; }
     public DateTimeOffset DetectedAt { get; set; } = DateTimeOffset.UtcNow;
 }
 
@@ -481,17 +641,29 @@ public sealed class RepairDocument
     public string WinnerNode { get; set; } = string.Empty;
     public string? WinnerCV { get; set; }
     public List<string> AffectedNodes { get; set; } = [];
-    public string PatchQuery { get; set; } = string.Empty;
     public long? PatchOperationId { get; set; }
+    public string? SourceRepairPlanId { get; set; }
+    public string? SourceRepairPlanRunId { get; set; }
     public string RepairStatus { get; set; } = string.Empty;
+    public long? DocumentsAttempted { get; set; }
+    public long? DocumentsPatchedOnWinner { get; set; }
+    public long? DocumentsFailed { get; set; }
     public DateTimeOffset CompletedAt { get; set; } = DateTimeOffset.UtcNow;
     public string? Error { get; set; }
 }
 
+public sealed class BlockedApplyExecutionCountIndexEntry
+{
+    public string RunId { get; set; } = string.Empty;
+    public string? SourceRepairPlanRunId { get; set; }
+    public int Count { get; set; }
+}
+
 /// <summary>
-/// Repair guard preventing the same document from being patched more than once per run.
+/// Per-run guard preventing the same document from being planned or applied more than once.
+/// This is an idempotency barrier for one run, not a durable repair history record.
 /// </summary>
-public sealed class RepairGuardDocument
+public sealed class RepairActionGuardDocument
 {
     public string Id { get; set; } = string.Empty;
     public string RunId { get; set; } = string.Empty;
@@ -499,7 +671,67 @@ public sealed class RepairGuardDocument
     public string WinnerNode { get; set; } = string.Empty;
     public string? WinnerCV { get; set; }
     public long? PatchOperationId { get; set; }
-    public DateTimeOffset PatchedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset RecordedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
+/// <summary>
+/// Live metadata snapshot captured during <see cref="RunMode.ApplyRepairPlan"/> when the
+/// current cluster state no longer matches the imported snapshot that produced the saved
+/// repair plan.
+/// </summary>
+public sealed class RepairStateChangedDocument
+{
+    public string Id { get; set; } = string.Empty;
+    public string ApplyRunId { get; set; } = string.Empty;
+    public string SourceRepairPlanRunId { get; set; } = string.Empty;
+    public string? SourceSnapshotRunId { get; set; }
+    public string DocumentId { get; set; } = string.Empty;
+    public string? SourceMismatchType { get; set; }
+    public string? SourceWinnerNode { get; set; }
+    public string? SourceWinnerCV { get; set; }
+    public List<NodeObservedState> SourceObservedState { get; set; } = [];
+    public bool LiveIsConsistent { get; set; }
+    public string? LiveMismatchType { get; set; }
+    public string? LiveWinnerNode { get; set; }
+    public string? LiveWinnerCV { get; set; }
+    public List<NodeObservedState> LiveObservedState { get; set; } = [];
+    public string Reason { get; set; } = string.Empty;
+    public DateTimeOffset RecordedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
+/// <summary>
+/// Snapshot row that had to be skipped after retry because the local bulk-insert sink
+/// could not get it durably accepted by the local state store.
+/// </summary>
+public sealed class SnapshotImportSkippedDocument
+{
+    public string Id { get; set; } = string.Empty;
+    public string RunId { get; set; } = string.Empty;
+    public string OriginalDocumentId { get; set; } = string.Empty;
+    public string SnapshotDocumentId { get; set; } = string.Empty;
+    public string FromNode { get; set; } = string.Empty;
+    public string NodeUrl { get; set; } = string.Empty;
+    public int FailureCount { get; set; }
+    public string? LastConfirmedSnapshotIdBeforeSkip { get; set; }
+    public string? Error { get; set; }
+    public DateTimeOffset SkippedAt { get; set; } = DateTimeOffset.UtcNow;
+}
+
+/// <summary>
+/// Snapshot row whose original document id contained characters that are unsafe for the
+/// RavenDB bulk-insert document-id serialization path, so a normalized physical snapshot
+/// id was used instead.
+/// </summary>
+public sealed class UnsafeSnapshotIdDocument
+{
+    public string Id { get; set; } = string.Empty;
+    public string RunId { get; set; } = string.Empty;
+    public string OriginalDocumentId { get; set; } = string.Empty;
+    public string NormalizedSnapshotDocumentId { get; set; } = string.Empty;
+    public string FromNode { get; set; } = string.Empty;
+    public string NodeUrl { get; set; } = string.Empty;
+    public string NormalizationReason { get; set; } = string.Empty;
+    public DateTimeOffset DetectedAt { get; set; } = DateTimeOffset.UtcNow;
 }
 
 /// <summary>
