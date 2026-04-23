@@ -1,6 +1,18 @@
 using ConsistencyCheck;
 using Spectre.Console;
 
+SchedulerLaunchOptions launchOptions;
+try
+{
+    launchOptions = SchedulerLaunchOptions.Parse(args);
+}
+catch (InvalidOperationException ex)
+{
+    AnsiConsole.MarkupLine($"[red]Invalid command line: {Markup.Escape(ex.Message)}[/]");
+    Environment.ExitCode = 1;
+    return;
+}
+
 AnsiConsole.Write(new FigletText("ConsistencyCheck").Color(Color.CornflowerBlue));
 AnsiConsole.MarkupLine("[grey]RavenDB Cluster Consistency Checker  v2.0[/]");
 AnsiConsole.MarkupLine("[grey]Snapshot + local-index analysis with local RavenDB state storage.[/]");
@@ -17,18 +29,41 @@ Console.CancelKeyPress += (_, e) =>
 var outputDir = Path.Combine(AppContext.BaseDirectory, "output");
 Directory.CreateDirectory(outputDir);
 
+var healthStatus = new HealthStatusReporter(launchOptions);
+HealthEndpointServer? healthEndpoint = null;
 var progressStore = new ProgressStore(outputDir);
 RunMode? activeRunMode = null;
+LiveETagScanLaunchMode activeLiveETagLaunchMode = LiveETagScanLaunchMode.SingleNodeManual;
+LiveETagClusterExecutionMode activeLiveETagClusterExecutionMode = LiveETagClusterExecutionMode.SinglePass;
 
 try
 {
-    var resolved = await ResolveRunContextAsync(progressStore, cts.Token);
+    if (launchOptions.IsSchedulerProfile)
+    {
+        healthStatus.MarkStarting();
+        healthEndpoint = HealthEndpointServer.Create(launchOptions, healthStatus);
+        await healthEndpoint.StartAsync(cts.Token).ConfigureAwait(false);
+        AnsiConsole.MarkupLine(
+            $"[green]Health endpoint listening on[/] [cyan]{Markup.Escape(launchOptions.HealthBindUrl + launchOptions.HealthPath)}[/]");
+        AnsiConsole.WriteLine();
+    }
+
+    var resolved = await ResolveRunContextAsync(progressStore, launchOptions, healthStatus, cts.Token);
     await using var stateStore = resolved.StateStore;
 
     var config = resolved.Config;
+    healthStatus.MarkConfigured(config);
     activeRunMode = config.RunMode;
+    activeLiveETagLaunchMode = config.LiveETagScanLaunchMode;
+    activeLiveETagClusterExecutionMode = config.LiveETagClusterExecutionMode;
+    var isLiveEtagClusterCoordinator =
+        config.RunMode == RunMode.LiveETagScan &&
+        config.LiveETagScanLaunchMode == LiveETagScanLaunchMode.AllNodesAutomatic;
+    var isLiveEtagRecurringCoordinator =
+        isLiveEtagClusterCoordinator &&
+        config.LiveETagClusterExecutionMode == LiveETagClusterExecutionMode.Recurring;
     var run = resolved.Run;
-    var semanticsSnapshot = run.ChangeVectorSemanticsSnapshot;
+    var semanticsSnapshot = run?.ChangeVectorSemanticsSnapshot;
 
     using var certificateValidationScope = RunModePolicies.RequiresCustomerClusterConnectivity(config.RunMode)
         ? RavenCertificateValidationScope.Create(
@@ -36,7 +71,7 @@ try
             config.AllowInvalidServerCertificates)
         : null;
 
-    if (RunModePolicies.RequiresStartupConnectivityValidation(config.RunMode))
+    if (!resolved.StartupConnectivityValidated && RunModePolicies.RequiresStartupConnectivityValidation(config.RunMode))
         await RuntimeConnectivityValidator.ValidateAsync(config, cts.Token);
 
     var startupTitle = config.RunMode switch
@@ -45,7 +80,11 @@ try
         RunMode.DownloadSnapshotsToCache => "[bold green]Downloading snapshots to local cache[/]",
         RunMode.ImportCachedSnapshotsToStateStore => "[bold green]Importing cached snapshots into local RavenDB[/]",
         RunMode.ApplyRepairPlan => "[bold green]Applying saved repair plan[/]",
-        RunMode.LiveETagScan => "[bold green]Live ETag scan — building repair plan[/]",
+        RunMode.LiveETagScan => isLiveEtagClusterCoordinator
+            ? isLiveEtagRecurringCoordinator
+                ? "[bold green]Live ETag recurring scan + recovery across all nodes[/]"
+                : "[bold green]Live ETag scan + recovery across all nodes[/]"
+            : "[bold green]Live ETag scan — building repair plan[/]",
         RunMode.SnapshotCrossCheck => "[bold green][[TEMP]] Snapshot cross-check — building repair plan[/]",
         RunMode.MismatchDecisionFixup => "[bold green][[TEMP2]] Mismatch decision fixup[/]",
         _ => "[bold green]Analyzing imported snapshots[/]"
@@ -67,7 +106,11 @@ try
         RunMode.ApplyRepairPlan =>
             "Saved repair-plan execution with live per-document revalidation before every patch",
         RunMode.LiveETagScan =>
-            "Live ETag stream from source node → metadata from all nodes → repair plan (no snapshot import needed)",
+            isLiveEtagClusterCoordinator
+                ? isLiveEtagRecurringCoordinator
+                    ? $"Sequential live ETag scan per node → immediate apply for that node → next node → wait {config.LiveETagRecurringIntervalMinutes.GetValueOrDefault():N0} minutes after the full cycle → repeat"
+                    : "Sequential live ETag scan per node → immediate apply for that node → next node"
+                : "Live ETag stream from source node → metadata from all nodes → repair plan (no snapshot import needed)",
         RunMode.SnapshotCrossCheck =>
             "[TEMP] Enumerate all imported snapshots node by node → fetch live metadata → repair plan (bypasses index)",
         RunMode.MismatchDecisionFixup =>
@@ -99,7 +142,8 @@ try
                 : $"[yellow]{Markup.Escape(DescribeIdList(semanticsSnapshot.PotentialUnusedDatabaseIds))}[/] [grey](warning only)[/]")}");
     }
     AnsiConsole.MarkupLine($"  State store     : [cyan]{Markup.Escape(config.StateStore.ServerUrl)}[/] / [cyan]{Markup.Escape(config.StateStore.DatabaseName)}[/]");
-    AnsiConsole.MarkupLine($"  Run ID          : [cyan]{Markup.Escape(run.RunId)}[/]");
+    if (run != null)
+        AnsiConsole.MarkupLine($"  Run ID          : [cyan]{Markup.Escape(run.RunId)}[/]");
     if (config.RunMode is RunMode.DownloadSnapshotsToCache or RunMode.ImportCachedSnapshotsToStateStore &&
         TryGetSelectedImportNode(config) is { } selectedImportNode)
     {
@@ -108,9 +152,9 @@ try
             : "Import node";
         AnsiConsole.MarkupLine($"  {selectedLabel,-15}: [cyan]{Markup.Escape(selectedImportNode.Label)}[/]  ({Markup.Escape(selectedImportNode.Url)})");
     }
-    if (config.RunMode == RunMode.ImportCachedSnapshotsToStateStore && !string.IsNullOrWhiteSpace(run.SourceSnapshotCacheRunId))
+    if (config.RunMode == RunMode.ImportCachedSnapshotsToStateStore && run != null && !string.IsNullOrWhiteSpace(run.SourceSnapshotCacheRunId))
         AnsiConsole.MarkupLine($"  Source cache    : [cyan]{Markup.Escape(run.SourceSnapshotCacheRunId)}[/]");
-    if (config.RunMode == RunMode.ApplyRepairPlan && !string.IsNullOrWhiteSpace(run.SourceRepairPlanRunId))
+    if (config.RunMode == RunMode.ApplyRepairPlan && run != null && !string.IsNullOrWhiteSpace(run.SourceRepairPlanRunId))
         AnsiConsole.MarkupLine($"  Source plan     : [cyan]{Markup.Escape(run.SourceRepairPlanRunId)}[/]");
     if (config.RunMode == RunMode.ApplyRepairPlan)
     {
@@ -120,22 +164,39 @@ try
         AnsiConsole.MarkupLine($"  Apply mode      : [cyan]{Markup.Escape(applyModeText)}[/]");
     }
     if (config.RunMode is RunMode.ScanOnly or RunMode.DryRunRepair or RunMode.ScanAndRepair &&
+        run != null &&
         !string.IsNullOrWhiteSpace(run.SourceSnapshotRunId))
     {
         AnsiConsole.MarkupLine($"  Source snapshot : [cyan]{Markup.Escape(run.SourceSnapshotRunId)}[/]");
     }
     if (config.RunMode == RunMode.LiveETagScan)
     {
-        var sourceNode = config.Nodes[config.SourceNodeIndex];
-        AnsiConsole.MarkupLine($"  Source node     : [cyan]{Markup.Escape(sourceNode.Label)}[/]  ({Markup.Escape(sourceNode.Url)})");
+        if (isLiveEtagClusterCoordinator)
+        {
+            var liveCycleText = isLiveEtagRecurringCoordinator
+                ? $"scan one node -> apply -> next node -> wait {config.LiveETagRecurringIntervalMinutes.GetValueOrDefault():N0} min -> repeat"
+                : "scan one node -> apply -> next node";
+            AnsiConsole.MarkupLine($"  Live cycle      : [cyan]{Markup.Escape(liveCycleText)}[/]");
+            if (isLiveEtagRecurringCoordinator)
+            {
+                AnsiConsole.MarkupLine(
+                    $"  Cycle delay     : [cyan]{config.LiveETagRecurringIntervalMinutes.GetValueOrDefault():N0}[/] min after a full all-node cycle");
+            }
+        }
+        else
+        {
+            var sourceNode = config.Nodes[config.SourceNodeIndex];
+            AnsiConsole.MarkupLine($"  Source node     : [cyan]{Markup.Escape(sourceNode.Label)}[/]  ({Markup.Escape(sourceNode.Url)})");
+        }
     }
     if (config.RunMode == RunMode.SnapshotCrossCheck)
         AnsiConsole.MarkupLine($"  Already repaired: [cyan]{repairedDocCount:N0}[/] docs (will be skipped)");
-    if (config.RunMode == RunMode.MismatchDecisionFixup && !string.IsNullOrWhiteSpace(run.SourceSnapshotRunId))
+    if (config.RunMode == RunMode.MismatchDecisionFixup && run != null && !string.IsNullOrWhiteSpace(run.SourceSnapshotRunId))
         AnsiConsole.MarkupLine($"  Target run      : [cyan]{Markup.Escape(run.SourceSnapshotRunId)}[/]");
     AnsiConsole.WriteLine();
 
-    RunStateDocument finalRun = run;
+    RunStateDocument? finalRun = run;
+    LiveETagClusterRecoverySummary? liveEtagClusterSummary = null;
     var importProgressMode = config.RunMode is RunMode.ImportSnapshots or RunMode.DownloadSnapshotsToCache or RunMode.ImportCachedSnapshotsToStateStore;
     var automaticApplyMode = config.RunMode == RunMode.ApplyRepairPlan &&
                              config.ApplyExecutionMode == ApplyExecutionMode.Automatic;
@@ -159,7 +220,7 @@ try
                 $"  patched {update.RepairsPatchedOnWinner:N0}" +
                 $"  failed {update.RepairsFailed:N0}   ");
         };
-        finalRun = await executor.RunAsync(run, cts.Token).ConfigureAwait(false);
+        finalRun = await executor.RunAsync(run!, cts.Token).ConfigureAwait(false);
         if (autoModeActivated)
             AnsiConsole.WriteLine();
     }
@@ -256,6 +317,8 @@ try
 
             void OnProgress(IndexedRunProgressUpdate update)
             {
+                healthStatus.RecordProgress(update);
+
                 lock (progressLock)
                 {
                     var phaseText = $"[grey]{Markup.Escape(update.Phase)}[/]";
@@ -306,7 +369,9 @@ try
                         RunMode.ApplyRepairPlan =>
                             $"  applied [green]{update.RepairsPatchedOnWinner:N0}[/]/[yellow]{update.RepairsAttempted:N0}[/]/[red]{update.RepairsFailed:N0}[/]",
                         RunMode.LiveETagScan =>
-                            $"  inspected [cyan]{update.DocumentsInspected:N0}[/]  mismatches [red]{update.MismatchesFound:N0}[/]  planned [yellow]{update.RepairsPlanned:N0}[/]",
+                            isLiveEtagClusterCoordinator
+                                ? $"  inspected [cyan]{update.DocumentsInspected:N0}[/]  mismatches [red]{update.MismatchesFound:N0}[/]  planned [yellow]{update.RepairsPlanned:N0}[/]  applied [green]{update.RepairsPatchedOnWinner:N0}[/]/[yellow]{update.RepairsAttempted:N0}[/]/[red]{update.RepairsFailed:N0}[/]"
+                                : $"  inspected [cyan]{update.DocumentsInspected:N0}[/]  mismatches [red]{update.MismatchesFound:N0}[/]  planned [yellow]{update.RepairsPlanned:N0}[/]",
                         RunMode.SnapshotCrossCheck =>
                             $"  inspected [cyan]{update.DocumentsInspected:N0}[/]  mismatches [red]{update.MismatchesFound:N0}[/]  planned [yellow]{update.RepairsPlanned:N0}[/]{crossCheckRateText}",
                         RunMode.MismatchDecisionFixup =>
@@ -376,31 +441,38 @@ try
             {
                 await using var executor = new RepairPlanExecutor(config, stateStore);
                 executor.ProgressUpdated += OnProgress;
-                finalRun = await executor.RunAsync(run, cts.Token).ConfigureAwait(false);
+                finalRun = await executor.RunAsync(run!, cts.Token).ConfigureAwait(false);
+            }
+            else if (config.RunMode == RunMode.LiveETagScan && isLiveEtagClusterCoordinator)
+            {
+                healthStatus.MarkCoordinatorStarting(config);
+                var coordinator = new LiveETagClusterRecoveryCoordinator(config, stateStore);
+                coordinator.ProgressUpdated += OnProgress;
+                liveEtagClusterSummary = await coordinator.RunAsync(cts.Token).ConfigureAwait(false);
             }
             else if (config.RunMode == RunMode.LiveETagScan)
             {
                 await using var scanner = new LiveETagScanPlanner(config, stateStore);
                 scanner.ProgressUpdated += OnProgress;
-                finalRun = await scanner.RunAsync(run, cts.Token).ConfigureAwait(false);
+                finalRun = await scanner.RunAsync(run!, cts.Token).ConfigureAwait(false);
             }
             else if (config.RunMode == RunMode.SnapshotCrossCheck)
             {
                 await using var planner = new SnapshotCrossCheckPlanner(config, stateStore);
                 planner.ProgressUpdated += OnProgress;
-                finalRun = await planner.RunAsync(run, cts.Token).ConfigureAwait(false);
+                finalRun = await planner.RunAsync(run!, cts.Token).ConfigureAwait(false);
             }
             else if (config.RunMode == RunMode.MismatchDecisionFixup)
             {
                 await using var fixup = new MismatchDecisionFixupPlanner(stateStore);
                 fixup.ProgressUpdated += OnProgress;
-                finalRun = await fixup.RunAsync(run, cts.Token).ConfigureAwait(false);
+                finalRun = await fixup.RunAsync(run!, cts.Token).ConfigureAwait(false);
             }
             else
             {
                 await using var checker = new IndexedConsistencyChecker(config, stateStore);
                 checker.ProgressUpdated += OnProgress;
-                finalRun = await checker.RunAsync(run, cts.Token).ConfigureAwait(false);
+                finalRun = await checker.RunAsync(run!, cts.Token).ConfigureAwait(false);
             }
 
             summaryTask.Value = summaryTask.MaxValue;
@@ -410,74 +482,84 @@ try
     }
 
     AnsiConsole.WriteLine();
-    var statusMarkup = finalRun.IsComplete
-        ? "[bold green]Complete[/]"
-        : "[bold yellow]Interrupted / stopped early[/]";
-    var primarySnapshotLabel = config.RunMode switch
+    if (isLiveEtagClusterCoordinator)
     {
-        RunMode.DownloadSnapshotsToCache => "Cache rows downloaded",
-        _ => "Snapshot docs imported"
-    };
-    var primarySnapshotValue = config.RunMode switch
+        WriteLiveEtagClusterRecoverySummary(
+            config,
+            liveEtagClusterSummary ?? throw new InvalidOperationException("Live ETag cluster recovery completed without a summary."));
+    }
+    else
     {
-        RunMode.DownloadSnapshotsToCache => finalRun.SnapshotCacheNodes.Sum(node => node.DownloadedRows),
-        _ => finalRun.SnapshotDocumentsImported
-    };
-    var completedNodeLabel = config.RunMode switch
-    {
-        RunMode.ImportSnapshots => "Import nodes completed",
-        RunMode.DownloadSnapshotsToCache => "Cache nodes completed",
-        RunMode.ImportCachedSnapshotsToStateStore => "Import nodes completed",
-        _ => "Cluster nodes"
-    };
-    var completedNodeValue = config.RunMode switch
-    {
-        RunMode.ImportSnapshots => $"{finalRun.SnapshotImportNodes.Count(node => node.IsImportComplete):N0}/{config.Nodes.Count:N0}",
-        RunMode.DownloadSnapshotsToCache => $"{finalRun.SnapshotCacheNodes.Count(node => node.IsDownloadComplete):N0}/{config.Nodes.Count:N0}",
-        RunMode.ImportCachedSnapshotsToStateStore => $"{finalRun.SnapshotImportNodes.Count(node => node.IsImportComplete):N0}/{config.Nodes.Count:N0}",
-        _ => $"{config.Nodes.Count:N0}"
-    };
+        var completedRun = finalRun ?? throw new InvalidOperationException("The selected run completed without a final run document.");
+        var statusMarkup = completedRun.IsComplete
+            ? "[bold green]Complete[/]"
+            : "[bold yellow]Interrupted / stopped early[/]";
+        var primarySnapshotLabel = config.RunMode switch
+        {
+            RunMode.DownloadSnapshotsToCache => "Cache rows downloaded",
+            _ => "Snapshot docs imported"
+        };
+        var primarySnapshotValue = config.RunMode switch
+        {
+            RunMode.DownloadSnapshotsToCache => completedRun.SnapshotCacheNodes.Sum(node => node.DownloadedRows),
+            _ => completedRun.SnapshotDocumentsImported
+        };
+        var completedNodeLabel = config.RunMode switch
+        {
+            RunMode.ImportSnapshots => "Import nodes completed",
+            RunMode.DownloadSnapshotsToCache => "Cache nodes completed",
+            RunMode.ImportCachedSnapshotsToStateStore => "Import nodes completed",
+            _ => "Cluster nodes"
+        };
+        var completedNodeValue = config.RunMode switch
+        {
+            RunMode.ImportSnapshots => $"{completedRun.SnapshotImportNodes.Count(node => node.IsImportComplete):N0}/{config.Nodes.Count:N0}",
+            RunMode.DownloadSnapshotsToCache => $"{completedRun.SnapshotCacheNodes.Count(node => node.IsDownloadComplete):N0}/{config.Nodes.Count:N0}",
+            RunMode.ImportCachedSnapshotsToStateStore => $"{completedRun.SnapshotImportNodes.Count(node => node.IsImportComplete):N0}/{config.Nodes.Count:N0}",
+            _ => $"{config.Nodes.Count:N0}"
+        };
 
-    var isAnalysisSummary = finalRun.RunMode is RunMode.ScanOnly or RunMode.DryRunRepair or RunMode.LiveETagScan or RunMode.SnapshotCrossCheck or RunMode.MismatchDecisionFixup;
-    var summaryBody = isAnalysisSummary
-        ? $"[grey]{primarySnapshotLabel,-25}:[/] [bold]{primarySnapshotValue:N0}[/]\n" +
-          $"[grey]{completedNodeLabel,-25}:[/] [bold]{completedNodeValue}[/]\n" +
-          $"[grey]Unhealthy documents      :[/] [bold red]{finalRun.MismatchesFound:N0}[/]\n" +
-          $"[grey]Automatic repair docs    :[/] [bold yellow]{finalRun.RepairsPlanned:N0}[/]\n" +
-          $"[grey]Manual review docs       :[/] [bold magenta]{finalRun.ManualReviewDocumentsFound:N0}[/]\n" +
-          $"[grey]Run status               :[/] {statusMarkup}\n" +
-          $"{(string.IsNullOrWhiteSpace(finalRun.SourceRepairPlanRunId) ? string.Empty : $"[grey]Source plan run          :[/] [cyan]{Markup.Escape(finalRun.SourceRepairPlanRunId)}[/]\n")}" +
-          $"{(string.IsNullOrWhiteSpace(finalRun.SourceSnapshotCacheRunId) ? string.Empty : $"[grey]Source cache run         :[/] [cyan]{Markup.Escape(finalRun.SourceSnapshotCacheRunId)}[/]\n")}" +
-          $"{(string.IsNullOrWhiteSpace(finalRun.SourceSnapshotRunId) ? string.Empty : $"[grey]Source snapshot run      :[/] [cyan]{Markup.Escape(finalRun.SourceSnapshotRunId)}[/]\n")}" +
-          $"[grey]State store              :[/] [cyan]{Markup.Escape(config.StateStore.ServerUrl)}[/] / [cyan]{Markup.Escape(config.StateStore.DatabaseName)}[/]\n" +
-          $"[grey]Run ID                   :[/] [cyan]{Markup.Escape(finalRun.RunId)}[/]"
-        : $"[grey]{primarySnapshotLabel,-25}:[/] [bold]{primarySnapshotValue:N0}[/]\n" +
-          $"[grey]{completedNodeLabel,-25}:[/] [bold]{completedNodeValue}[/]\n" +
-          $"[grey]Snapshot docs skipped     :[/] [bold red]{finalRun.SnapshotDocumentsSkipped:N0}[/]\n" +
-          $"[grey]Bulk-insert restarts     :[/] [bold yellow]{finalRun.SnapshotBulkInsertRestarts:N0}[/]\n" +
-          $"[grey]Candidates found         :[/] [bold]{finalRun.CandidateDocumentsFound:N0}[/]\n" +
-          $"[grey]Candidates processed     :[/] [bold]{finalRun.CandidateDocumentsProcessed:N0}[/]\n" +
-          $"[grey]Candidates excluded skip :[/] [bold yellow]{finalRun.CandidateDocumentsExcludedBySkippedSnapshots:N0}[/]\n" +
-          $"[grey]Documents inspected      :[/] [bold]{finalRun.DocumentsInspected:N0}[/]\n" +
-          $"[grey]Unique versions compared :[/] [bold]{finalRun.UniqueVersionsCompared:N0}[/]\n" +
-          $"[grey]Mismatches found         :[/] [bold red]{finalRun.MismatchesFound:N0}[/]\n" +
-          $"[grey]Repairs planned          :[/] [bold yellow]{finalRun.RepairsPlanned:N0}[/]\n" +
-          $"[grey]Repairs attempted        :[/] [bold]{finalRun.RepairsAttempted:N0}[/]\n" +
-          $"[grey]Repairs patched winner   :[/] [bold green]{finalRun.RepairsPatchedOnWinner:N0}[/]\n" +
-          $"[grey]Repairs failed           :[/] [bold red]{finalRun.RepairsFailed:N0}[/]\n" +
-          $"[grey]Run status               :[/] {statusMarkup}\n" +
-          $"{(string.IsNullOrWhiteSpace(finalRun.SourceRepairPlanRunId) ? string.Empty : $"[grey]Source plan run          :[/] [cyan]{Markup.Escape(finalRun.SourceRepairPlanRunId)}[/]\n")}" +
-          $"{(string.IsNullOrWhiteSpace(finalRun.SourceSnapshotCacheRunId) ? string.Empty : $"[grey]Source cache run         :[/] [cyan]{Markup.Escape(finalRun.SourceSnapshotCacheRunId)}[/]\n")}" +
-          $"{(string.IsNullOrWhiteSpace(finalRun.SourceSnapshotRunId) ? string.Empty : $"[grey]Source snapshot run      :[/] [cyan]{Markup.Escape(finalRun.SourceSnapshotRunId)}[/]\n")}" +
-          $"[grey]State store              :[/] [cyan]{Markup.Escape(config.StateStore.ServerUrl)}[/] / [cyan]{Markup.Escape(config.StateStore.DatabaseName)}[/]\n" +
-          $"[grey]Run ID                   :[/] [cyan]{Markup.Escape(finalRun.RunId)}[/]";
+        var isAnalysisSummary = completedRun.RunMode is RunMode.ScanOnly or RunMode.DryRunRepair or RunMode.LiveETagScan or RunMode.SnapshotCrossCheck or RunMode.MismatchDecisionFixup;
+        var summaryBody = isAnalysisSummary
+            ? $"[grey]{primarySnapshotLabel,-25}:[/] [bold]{primarySnapshotValue:N0}[/]\n" +
+              $"[grey]{completedNodeLabel,-25}:[/] [bold]{completedNodeValue}[/]\n" +
+              $"[grey]Unhealthy documents      :[/] [bold red]{completedRun.MismatchesFound:N0}[/]\n" +
+              $"[grey]Automatic repair docs    :[/] [bold yellow]{completedRun.RepairsPlanned:N0}[/]\n" +
+              $"[grey]Manual review docs       :[/] [bold magenta]{completedRun.ManualReviewDocumentsFound:N0}[/]\n" +
+              $"[grey]Run status               :[/] {statusMarkup}\n" +
+              $"{(string.IsNullOrWhiteSpace(completedRun.SourceRepairPlanRunId) ? string.Empty : $"[grey]Source plan run          :[/] [cyan]{Markup.Escape(completedRun.SourceRepairPlanRunId)}[/]\n")}" +
+              $"{(string.IsNullOrWhiteSpace(completedRun.SourceSnapshotCacheRunId) ? string.Empty : $"[grey]Source cache run         :[/] [cyan]{Markup.Escape(completedRun.SourceSnapshotCacheRunId)}[/]\n")}" +
+              $"{(string.IsNullOrWhiteSpace(completedRun.SourceSnapshotRunId) ? string.Empty : $"[grey]Source snapshot run      :[/] [cyan]{Markup.Escape(completedRun.SourceSnapshotRunId)}[/]\n")}" +
+              $"[grey]State store              :[/] [cyan]{Markup.Escape(config.StateStore.ServerUrl)}[/] / [cyan]{Markup.Escape(config.StateStore.DatabaseName)}[/]\n" +
+              $"[grey]Run ID                   :[/] [cyan]{Markup.Escape(completedRun.RunId)}[/]"
+            : $"[grey]{primarySnapshotLabel,-25}:[/] [bold]{primarySnapshotValue:N0}[/]\n" +
+              $"[grey]{completedNodeLabel,-25}:[/] [bold]{completedNodeValue}[/]\n" +
+              $"[grey]Snapshot docs skipped     :[/] [bold red]{completedRun.SnapshotDocumentsSkipped:N0}[/]\n" +
+              $"[grey]Bulk-insert restarts     :[/] [bold yellow]{completedRun.SnapshotBulkInsertRestarts:N0}[/]\n" +
+              $"[grey]Candidates found         :[/] [bold]{completedRun.CandidateDocumentsFound:N0}[/]\n" +
+              $"[grey]Candidates processed     :[/] [bold]{completedRun.CandidateDocumentsProcessed:N0}[/]\n" +
+              $"[grey]Candidates excluded skip :[/] [bold yellow]{completedRun.CandidateDocumentsExcludedBySkippedSnapshots:N0}[/]\n" +
+              $"[grey]Documents inspected      :[/] [bold]{completedRun.DocumentsInspected:N0}[/]\n" +
+              $"[grey]Unique versions compared :[/] [bold]{completedRun.UniqueVersionsCompared:N0}[/]\n" +
+              $"[grey]Mismatches found         :[/] [bold red]{completedRun.MismatchesFound:N0}[/]\n" +
+              $"[grey]Repairs planned          :[/] [bold yellow]{completedRun.RepairsPlanned:N0}[/]\n" +
+              $"[grey]Repairs attempted        :[/] [bold]{completedRun.RepairsAttempted:N0}[/]\n" +
+              $"[grey]Repairs patched winner   :[/] [bold green]{completedRun.RepairsPatchedOnWinner:N0}[/]\n" +
+              $"[grey]Repairs failed           :[/] [bold red]{completedRun.RepairsFailed:N0}[/]\n" +
+              $"[grey]Run status               :[/] {statusMarkup}\n" +
+              $"{(string.IsNullOrWhiteSpace(completedRun.SourceRepairPlanRunId) ? string.Empty : $"[grey]Source plan run          :[/] [cyan]{Markup.Escape(completedRun.SourceRepairPlanRunId)}[/]\n")}" +
+              $"{(string.IsNullOrWhiteSpace(completedRun.SourceSnapshotCacheRunId) ? string.Empty : $"[grey]Source cache run         :[/] [cyan]{Markup.Escape(completedRun.SourceSnapshotCacheRunId)}[/]\n")}" +
+              $"{(string.IsNullOrWhiteSpace(completedRun.SourceSnapshotRunId) ? string.Empty : $"[grey]Source snapshot run      :[/] [cyan]{Markup.Escape(completedRun.SourceSnapshotRunId)}[/]\n")}" +
+              $"[grey]State store              :[/] [cyan]{Markup.Escape(config.StateStore.ServerUrl)}[/] / [cyan]{Markup.Escape(config.StateStore.DatabaseName)}[/]\n" +
+              $"[grey]Run ID                   :[/] [cyan]{Markup.Escape(completedRun.RunId)}[/]";
 
-    var summary = new Panel(summaryBody)
-        .Header("[bold]Run Summary[/]")
-        .Border(BoxBorder.Rounded)
-        .Padding(1, 0);
+        var summary = new Panel(summaryBody)
+            .Header("[bold]Run Summary[/]")
+            .Border(BoxBorder.Rounded)
+            .Padding(1, 0);
 
-    AnsiConsole.Write(summary);
+        AnsiConsole.Write(summary);
+    }
 }
 catch (OperationCanceledException)
 {
@@ -485,6 +567,12 @@ catch (OperationCanceledException)
     AnsiConsole.MarkupLine(
         activeRunMode == RunMode.ApplyRepairPlan
             ? "[yellow]Run interrupted. Restart the tool and choose the existing apply-run to continue from its saved checkpoint.[/]"
+            : activeRunMode == RunMode.LiveETagScan &&
+              activeLiveETagLaunchMode == LiveETagScanLaunchMode.AllNodesAutomatic &&
+              activeLiveETagClusterExecutionMode == LiveETagClusterExecutionMode.Recurring
+                ? "[yellow]Run interrupted. Restart the tool, choose Live ETag scan -> all nodes automatically -> recurring cycle, and the coordinator will resume the pending per-node scan/apply cycle before continuing recurring passes.[/]"
+            : activeRunMode == RunMode.LiveETagScan && activeLiveETagLaunchMode == LiveETagScanLaunchMode.AllNodesAutomatic
+                ? "[yellow]Run interrupted. Restart the tool, choose Live ETag scan -> all nodes automatically, and the coordinator will resume the pending per-node scan/apply cycle.[/]"
             : activeRunMode == RunMode.LiveETagScan
                 ? "[yellow]Run interrupted. Restart the tool and choose the existing live ETag scan run to resume from its saved ETag position.[/]"
             : activeRunMode == RunMode.SnapshotCrossCheck
@@ -501,15 +589,29 @@ catch (OperationCanceledException)
 }
 catch (Exception ex)
 {
+    healthStatus.MarkFatal(ex);
+    Environment.ExitCode = 1;
     AnsiConsole.WriteLine();
     AnsiConsole.MarkupLine($"[red]Unexpected error: {Markup.Escape(ex.Message)}[/]");
     AnsiConsole.WriteException(ex, ExceptionFormats.ShortenPaths | ExceptionFormats.ShowLinks);
 }
+finally
+{
+    if (healthEndpoint != null)
+        await healthEndpoint.DisposeAsync().ConfigureAwait(false);
+}
 
 return;
 
-static async Task<ResolvedRunContext> ResolveRunContextAsync(ProgressStore progressStore, CancellationToken ct)
+static async Task<ResolvedRunContext> ResolveRunContextAsync(
+    ProgressStore progressStore,
+    SchedulerLaunchOptions launchOptions,
+    HealthStatusReporter healthStatus,
+    CancellationToken ct)
 {
+    if (launchOptions.IsSchedulerProfile)
+        return await ResolveSchedulerRunContextAsync(progressStore, launchOptions, healthStatus, ct).ConfigureAwait(false);
+
     while (true)
     {
         var config = await LoadOrConfigureConfigAsync(progressStore, ct).ConfigureAwait(false);
@@ -529,6 +631,9 @@ static async Task<ResolvedRunContext> ResolveRunContextAsync(ProgressStore progr
 
             if (selection.Cancelled)
                 throw new OperationCanceledException("Run selection was cancelled.");
+
+            if (selection.UseLiveETagClusterCoordinator)
+                return new ResolvedRunContext(config, stateStore, null);
 
             var run = selection.Run!;
             if (RunModePolicies.RequiresSemanticsSnapshot(run.RunMode))
@@ -553,6 +658,77 @@ static async Task<ResolvedRunContext> ResolveRunContextAsync(ProgressStore progr
             await stateStore.DisposeAsync().ConfigureAwait(false);
             throw;
         }
+    }
+}
+
+static async Task<ResolvedRunContext> ResolveSchedulerRunContextAsync(
+    ProgressStore progressStore,
+    SchedulerLaunchOptions launchOptions,
+    HealthStatusReporter healthStatus,
+    CancellationToken ct)
+{
+    var config = LoadSchedulerConfig(progressStore, launchOptions);
+    healthStatus.MarkConfigured(config);
+
+    return await StartupRetryPolicy.ExecuteAsync(
+            token => CreateSchedulerRunContextAttemptAsync(config, token),
+            launchOptions,
+            healthStatus,
+            attempt =>
+            {
+                var message =
+                    $"Startup dependency unavailable (attempt {attempt.Attempt:N0}); retrying in {attempt.Delay.TotalSeconds:N0}s. Error: {attempt.Exception.Message}";
+                FailoverLog.Append(message);
+                AnsiConsole.MarkupLine($"[yellow]{Markup.Escape(message)}[/]");
+            },
+            ct)
+        .ConfigureAwait(false);
+}
+
+static AppConfig LoadSchedulerConfig(ProgressStore progressStore, SchedulerLaunchOptions launchOptions)
+{
+    if (!progressStore.ConfigExists)
+    {
+        throw new InvalidOperationException(
+            "Scheduler profile requires an existing complete output/config.json. Run the interactive wizard once before installing the scheduled task.");
+    }
+
+    var config = progressStore.LoadConfig();
+    if (!ConfigWizard.IsConfigComplete(config))
+    {
+        throw new InvalidOperationException(
+            "Scheduler profile requires a complete output/config.json. Run the interactive wizard once to fill missing configuration.");
+    }
+
+    SchedulerLaunchProfile.ApplyToConfig(config, launchOptions);
+    return config;
+}
+
+static async Task<ResolvedRunContext> CreateSchedulerRunContextAttemptAsync(
+    AppConfig config,
+    CancellationToken ct)
+{
+    var stateStore = new StateStore(config.StateStore);
+    try
+    {
+        await stateStore.EnsureDatabaseExistsAsync(ct).ConfigureAwait(false);
+        await stateStore.EnsureLocalIndexesAsync(ct).ConfigureAwait(false);
+
+        using var certificateValidationScope = RunModePolicies.RequiresCustomerClusterConnectivity(config.RunMode)
+            ? RavenCertificateValidationScope.Create(
+                config.Nodes.Select(node => node.Url),
+                config.AllowInvalidServerCertificates)
+            : null;
+
+        if (RunModePolicies.RequiresStartupConnectivityValidation(config.RunMode))
+            await RuntimeConnectivityValidator.ValidateAsync(config, ct).ConfigureAwait(false);
+
+        return new ResolvedRunContext(config, stateStore, null, StartupConnectivityValidated: true);
+    }
+    catch
+    {
+        await stateStore.DisposeAsync().ConfigureAwait(false);
+        throw;
     }
 }
 
@@ -902,6 +1078,23 @@ static async Task<RunSelection> SelectLiveETagScanRunAsync(
     StateStore stateStore,
     CancellationToken ct)
 {
+    config.LiveETagScanLaunchMode = await ConfigWizard.AskForLiveETagScanLaunchModeAsync(ct).ConfigureAwait(false);
+    config.LiveETagClusterExecutionMode = LiveETagClusterExecutionMode.SinglePass;
+    config.LiveETagRecurringIntervalMinutes = null;
+    config.StartEtag = null;
+
+    if (config.LiveETagScanLaunchMode == LiveETagScanLaunchMode.AllNodesAutomatic)
+    {
+        config.LiveETagClusterExecutionMode = await ConfigWizard.AskForLiveETagClusterExecutionModeAsync(ct).ConfigureAwait(false);
+        if (config.LiveETagClusterExecutionMode == LiveETagClusterExecutionMode.Recurring)
+        {
+            config.LiveETagRecurringIntervalMinutes = await ConfigWizard.AskForLiveETagRecurringIntervalMinutesAsync(ct).ConfigureAwait(false);
+        }
+
+        config.SourceNodeIndex = 0;
+        return new RunSelection(null, false, Cancelled: false, UseLiveETagClusterCoordinator: true);
+    }
+
     var incompleteRuns = await stateStore
         .LoadIncompleteAnalysisRunsAsync(config.DatabaseName, RunMode.LiveETagScan, take: 10, ct)
         .ConfigureAwait(false);
@@ -1583,6 +1776,54 @@ static string DescribeScanPhase(ScanExecutionPhase phase) => phase switch
     _ => "not started"
 };
 
+static void WriteLiveEtagClusterRecoverySummary(
+    AppConfig config,
+    LiveETagClusterRecoverySummary summary)
+{
+    var statusMarkup = summary.IsComplete
+        ? "[bold green]Complete[/]"
+        : "[bold yellow]Interrupted / stopped early[/]";
+    var executionModeLine = config.LiveETagClusterExecutionMode == LiveETagClusterExecutionMode.Recurring
+        ? $"[grey]Execution mode            :[/] [bold]Recurring[/] [grey](wait {config.LiveETagRecurringIntervalMinutes.GetValueOrDefault():N0} min after each completed full cycle)[/]\n"
+        : "[grey]Execution mode            :[/] [bold]Single pass[/]\n";
+
+    var nodeLines = summary.NodeSummaries.Count == 0
+        ? "[grey]No node cycles were executed.[/]"
+        : string.Join(
+            "\n",
+            summary.NodeSummaries.Select(node =>
+            {
+                var applyText = node.ApplySkipped
+                    ? "[grey]apply skipped[/]"
+                    : node.ApplyRunId == null
+                        ? "[grey]apply n/a[/]"
+                        : $"apply [cyan]{Markup.Escape(node.ApplyRunId)}[/]";
+
+                return $"[grey]{Markup.Escape(node.NodeLabel),-12}[/]  scan [cyan]{Markup.Escape(node.ScanRunId ?? "n/a")}[/]  {applyText}  start etag [cyan]{node.StartEtag:N0}[/]  inspected [bold]{node.DocumentsInspected:N0}[/]  planned [bold yellow]{node.RepairsPlanned:N0}[/]  applied [bold green]{node.RepairsPatchedOnWinner:N0}[/]/[bold]{node.RepairsAttempted:N0}[/]/[bold red]{node.RepairsFailed:N0}[/]";
+            }));
+
+    var summaryBody =
+        executionModeLine +
+        $"[grey]Node cycles completed     :[/] [bold]{summary.NodesCompleted:N0}/{summary.TotalNodes:N0}[/]\n" +
+        $"[grey]Documents inspected      :[/] [bold]{summary.DocumentsInspected:N0}[/]\n" +
+        $"[grey]Mismatches found         :[/] [bold red]{summary.MismatchesFound:N0}[/]\n" +
+        $"[grey]Repairs planned          :[/] [bold yellow]{summary.RepairsPlanned:N0}[/]\n" +
+        $"[grey]Repairs attempted        :[/] [bold]{summary.RepairsAttempted:N0}[/]\n" +
+        $"[grey]Repairs patched winner   :[/] [bold green]{summary.RepairsPatchedOnWinner:N0}[/]\n" +
+        $"[grey]Repairs failed           :[/] [bold red]{summary.RepairsFailed:N0}[/]\n" +
+        $"[grey]Run status               :[/] {statusMarkup}\n" +
+        $"[grey]State store              :[/] [cyan]{Markup.Escape(config.StateStore.ServerUrl)}[/] / [cyan]{Markup.Escape(config.StateStore.DatabaseName)}[/]\n" +
+        "[grey]Node details             :[/]\n" +
+        nodeLines;
+
+    var panel = new Panel(summaryBody)
+        .Header("[bold]Run Summary[/]")
+        .Border(BoxBorder.Rounded)
+        .Padding(1, 0);
+
+    AnsiConsole.Write(panel);
+}
+
 static NodeConfig? TryGetSelectedImportNode(AppConfig config)
     => string.IsNullOrWhiteSpace(config.SelectedImportNodeUrl)
         ? null
@@ -1684,9 +1925,17 @@ static SnapshotCacheDownloadRunInfo ToSnapshotCacheDownloadRunInfo(RunStateDocum
     CompletedNodes = run.SnapshotCacheNodes.Count(node => node.IsDownloadComplete)
 };
 
-file sealed record ResolvedRunContext(AppConfig Config, StateStore StateStore, RunStateDocument Run);
+file sealed record ResolvedRunContext(
+    AppConfig Config,
+    StateStore StateStore,
+    RunStateDocument? Run,
+    bool StartupConnectivityValidated = false);
 
-file sealed record RunSelection(RunStateDocument? Run, bool Reconfigure, bool Cancelled = false);
+file sealed record RunSelection(
+    RunStateDocument? Run,
+    bool Reconfigure,
+    bool Cancelled = false,
+    bool UseLiveETagClusterCoordinator = false);
 file sealed record ApplyRunResumeChoice(ApplyRepairRunInfo? Run, bool Cancelled);
 file sealed record AnalysisRunResumeChoice(AnalysisRunInfo? Run, bool StartFresh, bool Cancelled);
 file sealed record CachedSnapshotImportResumeChoice(CachedSnapshotImportRunInfo? Run, bool StartFresh, bool Cancelled);

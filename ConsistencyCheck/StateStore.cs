@@ -345,6 +345,39 @@ public sealed class StateStore : IAsyncDisposable
             .ToList();
     }
 
+    internal async Task<LiveETagNodeWorkItem> ResolveLiveETagNodeWorkAsync(
+        string customerDatabaseName,
+        string sourceNodeUrl,
+        CancellationToken ct)
+    {
+        var runs = await LoadStartingWithAsync<RunStateDocument>("runs/", ct).ConfigureAwait(false);
+
+        var liveScanRuns = runs
+            .Where(run =>
+                string.Equals(run.CustomerDatabaseName, customerDatabaseName, StringComparison.OrdinalIgnoreCase) &&
+                run.RunMode == RunMode.LiveETagScan &&
+                string.Equals(
+                    LiveETagClusterRecoveryCoordinator.TryGetLiveETagSourceNodeUrl(run),
+                    sourceNodeUrl,
+                    StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        var sourceScanRunIds = liveScanRuns
+            .Select(run => run.RunId)
+            .Where(runId => string.IsNullOrWhiteSpace(runId) == false)
+            .ToHashSet(StringComparer.Ordinal);
+
+        var applyRuns = runs
+            .Where(run =>
+                string.Equals(run.CustomerDatabaseName, customerDatabaseName, StringComparison.OrdinalIgnoreCase) &&
+                run.RunMode == RunMode.ApplyRepairPlan &&
+                string.IsNullOrWhiteSpace(run.SourceRepairPlanRunId) == false &&
+                sourceScanRunIds.Contains(run.SourceRepairPlanRunId!))
+            .ToList();
+
+        return LiveETagClusterRecoveryCoordinator.ResolveNodeWork(liveScanRuns, applyRuns);
+    }
+
     internal async Task<IReadOnlyList<RepairDocument>> LoadExecutableRepairPlanDocumentsAsync(
         string sourcePlanRunId,
         CancellationToken ct)
@@ -980,6 +1013,7 @@ public sealed class StateStore : IAsyncDisposable
             Mode = config.Mode,
             RunMode = config.RunMode,
             ApplyExecutionMode = config.ApplyExecutionMode,
+            LiveETagScanLaunchMode = config.LiveETagScanLaunchMode,
             AllowInvalidServerCertificates = config.AllowInvalidServerCertificates,
             StartEtag = config.StartEtag,
             Throttle = new ThrottleConfig

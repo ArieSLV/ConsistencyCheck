@@ -115,6 +115,41 @@ public enum ApplyExecutionMode
 }
 
 /// <summary>
+/// Controls how <see cref="RunMode.LiveETagScan"/> is launched for the current run.
+/// </summary>
+public enum LiveETagScanLaunchMode
+{
+    /// <summary>
+    /// Ask the operator for one source node and an optional manual start ETag.
+    /// </summary>
+    SingleNodeManual,
+
+    /// <summary>
+    /// Iterate all configured nodes sequentially. For each node, scan first, then
+    /// immediately apply that node's repair plan before moving to the next node.
+    /// </summary>
+    AllNodesAutomatic
+}
+
+/// <summary>
+/// Controls whether automatic all-node Live ETag recovery stops after one full pass
+/// or keeps repeating with a delay between completed passes.
+/// </summary>
+public enum LiveETagClusterExecutionMode
+{
+    /// <summary>
+    /// Run exactly one all-node scan -> apply cycle and then exit.
+    /// </summary>
+    SinglePass,
+
+    /// <summary>
+    /// After each completed all-node cycle, wait for the configured launch-time delay
+    /// and then start the next cycle.
+    /// </summary>
+    Recurring
+}
+
+/// <summary>
 /// Tracks the current execution phase of a scan-style run so interrupted imports
 /// can be resumed deterministically.
 /// </summary>
@@ -302,6 +337,29 @@ public sealed class AppConfig
     /// </summary>
     [JsonConverter(typeof(JsonStringEnumConverter))]
     public ApplyExecutionMode ApplyExecutionMode { get; set; } = ApplyExecutionMode.InteractivePerDocument;
+
+    /// <summary>
+    /// Launch-only selection for <see cref="RunMode.LiveETagScan"/>.
+    /// Single-node mode preserves the existing manual workflow; all-node mode runs a
+    /// strict scan -> apply -> next-node cycle without per-node operator input.
+    /// </summary>
+    [JsonConverter(typeof(JsonStringEnumConverter))]
+    public LiveETagScanLaunchMode LiveETagScanLaunchMode { get; set; } = LiveETagScanLaunchMode.SingleNodeManual;
+
+    /// <summary>
+    /// Launch-only execution style for automatic all-node Live ETag processing.
+    /// Not persisted to <c>config.json</c>.
+    /// </summary>
+    [JsonIgnore]
+    public LiveETagClusterExecutionMode LiveETagClusterExecutionMode { get; set; } = LiveETagClusterExecutionMode.SinglePass;
+
+    /// <summary>
+    /// Launch-only delay between completed automatic all-node Live ETag cycles.
+    /// Used only when <see cref="LiveETagClusterExecutionMode"/> is <see cref="ConsistencyCheck.LiveETagClusterExecutionMode.Recurring"/>.
+    /// Not persisted to <c>config.json</c>.
+    /// </summary>
+    [JsonIgnore]
+    public int? LiveETagRecurringIntervalMinutes { get; set; }
 
     /// <summary>Throttling parameters. See <see cref="ThrottleConfig"/> for details.</summary>
     public ThrottleConfig Throttle { get; set; } = new();

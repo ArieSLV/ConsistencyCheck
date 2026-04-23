@@ -343,6 +343,54 @@ public sealed class ConfigWizard
             : ApplyExecutionMode.InteractivePerDocument;
     }
 
+    internal static async Task<LiveETagScanLaunchMode> AskForLiveETagScanLaunchModeAsync(CancellationToken ct)
+    {
+        const string singleNodeOption =
+            "Single node  [grey]- choose one source node and optionally type a manual start ETag[/]";
+        const string allNodesAutomaticOption =
+            "All nodes automatically  [grey]- scan one node, apply its repair plan, then move to the next node[/]";
+
+        var choice = await new SelectionPrompt<string>()
+            .Title("  Select [cyan]Live ETag launch mode[/]:")
+            .AddChoices(singleNodeOption, allNodesAutomaticOption)
+            .ShowAsync(AnsiConsole.Console, ct)
+            .ConfigureAwait(false);
+
+        return choice == allNodesAutomaticOption
+            ? LiveETagScanLaunchMode.AllNodesAutomatic
+            : LiveETagScanLaunchMode.SingleNodeManual;
+    }
+
+    internal static async Task<LiveETagClusterExecutionMode> AskForLiveETagClusterExecutionModeAsync(CancellationToken ct)
+    {
+        const string singlePassOption =
+            "Single pass  [grey]- run one full scan -> apply cycle across all configured nodes[/]";
+        const string recurringOption =
+            "Recurring cycle  [grey]- after a full all-node cycle finishes, wait N minutes and then start the next cycle[/]";
+
+        var choice = await new SelectionPrompt<string>()
+            .Title("  Select [cyan]all-node execution mode[/]:")
+            .AddChoices(singlePassOption, recurringOption)
+            .ShowAsync(AnsiConsole.Console, ct)
+            .ConfigureAwait(false);
+
+        return choice == recurringOption
+            ? LiveETagClusterExecutionMode.Recurring
+            : LiveETagClusterExecutionMode.SinglePass;
+    }
+
+    internal static async Task<int> AskForLiveETagRecurringIntervalMinutesAsync(CancellationToken ct)
+    {
+        return await new TextPrompt<int>(
+                "  Delay between completed full cycles in [cyan]minutes[/] [grey](starts only after a full all-node cycle finishes)[/]:")
+            .DefaultValue(15)
+            .Validate(value => value <= 0
+                ? ValidationResult.Error("[red]Delay must be greater than zero minutes.[/]")
+                : ValidationResult.Success())
+            .ShowAsync(AnsiConsole.Console, ct)
+            .ConfigureAwait(false);
+    }
+
     internal static async Task<(int SourceNodeIndex, long? StartEtag)> AskForLiveETagScanOptionsAsync(
         List<NodeConfig> nodes,
         CancellationToken ct)
@@ -757,6 +805,15 @@ public sealed class ConfigWizard
                 config.ApplyExecutionMode == ApplyExecutionMode.Automatic
                     ? "[yellow]Automatic[/]"
                     : "[green]Interactive per document[/]");
+        }
+
+        if (config.RunMode == RunMode.LiveETagScan)
+        {
+            table.AddRow(
+                "Live ETag mode",
+                config.LiveETagScanLaunchMode == LiveETagScanLaunchMode.AllNodesAutomatic
+                    ? "[yellow]All nodes automatic[/] [grey](scan -> apply -> next node)[/]"
+                    : "[green]Single node manual[/]");
         }
 
         for (var i = 0; i < config.Nodes.Count; i++)

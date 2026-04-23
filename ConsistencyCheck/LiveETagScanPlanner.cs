@@ -91,10 +91,7 @@ internal sealed class LiveETagScanPlanner : IAsyncDisposable
                 if (item.Etag > lastEtag)
                     lastEtag = item.Etag;
 
-                if (!string.Equals(item.Type, "Document", StringComparison.OrdinalIgnoreCase))
-                    continue;
-
-                if (HasFlag(item.Flags, "Conflicted"))
+                if (ShouldIncludePageItem(item.Type, item.Flags) == false)
                     continue;
 
                 if (!seenIds.Add(item.Id))
@@ -513,6 +510,20 @@ internal sealed class LiveETagScanPlanner : IAsyncDisposable
 
         value = 0;
         return false;
+    }
+
+    internal static bool ShouldIncludePageItem(string type, string? flags)
+    {
+        if (!string.Equals(type, "Document", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        if (HasFlag(flags, "Conflicted"))
+            return false;
+
+        if (HasFlag(flags, "DeleteRevision"))
+            return false;
+
+        return true;
     }
 
     private static bool HasFlag(string? flags, string expectedFlag)

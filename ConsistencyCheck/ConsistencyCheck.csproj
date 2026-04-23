@@ -19,6 +19,10 @@
     </ItemGroup>
 
     <ItemGroup>
+        <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    </ItemGroup>
+
+    <ItemGroup>
       <Content Include="obj\Release\net8.0\test.json" />
       <Content Include="obj\Release\test.xml" />
     </ItemGroup>
